@@ -19,6 +19,8 @@ from pathlib import Path
 from tqdm import tqdm
 from sentence_transformers import SentenceTransformer
 from torch.utils.data import Dataset, DataLoader
+import torch.nn.functional as F
+from transformers import AutoTokenizer, AutoModel
 
 
 # 配置日志
@@ -130,8 +132,31 @@ def collate_batch(batch):
     }
 
 
+def last_token_pool(last_hidden_states, attention_mask):
+    """
+    提取最后一个token的表示作为整个序列的表示
+    根据注意力掩码正确处理左填充和右填充
+    """
+    left_padding = (attention_mask[:, -1].sum() == attention_mask.shape[0])
+    if left_padding:
+        # 如果是左填充，直接取最后一个token
+        return last_hidden_states[:, -1]
+    else:
+        # 如果是右填充，需要根据attention_mask来获取每个样本的最后一个有效token
+        sequence_lengths = attention_mask.sum(dim=1) - 1
+        batch_size = last_hidden_states.shape[0]
+        return last_hidden_states[torch.arange(batch_size, device=last_hidden_states.device), sequence_lengths]
+
+
+def get_detailed_instruct(task_description, query):
+    """
+    构建指令格式的查询
+    """
+    return f'Instruct: {task_description}\nQuery: {query}'
+
+
 def generate_embeddings(model, texts, batch_size=8, prompt_name=None):
-    """批量生成嵌入向量"""
+    """批量生成嵌入向量 (使用SentenceTransformer)"""
     embeddings = []
     
     # 按批次处理
@@ -150,6 +175,77 @@ def generate_embeddings(model, texts, batch_size=8, prompt_name=None):
     return np.array(embeddings)
 
 
+def generate_embeddings_transformers(model_data, texts, batch_size=8, max_length=4096, task_description=None):
+    """
+    使用transformers库批量生成嵌入向量
+    
+    参数:
+        model_data: 包含tokenizer和model的字典
+        texts: 待编码的文本列表
+        batch_size: 批处理大小
+        max_length: 最大序列长度
+        task_description: 如果提供，会将文本构建为指令格式
+    
+    返回:
+        numpy数组形式的嵌入向量
+    """
+    tokenizer = model_data['tokenizer']
+    model = model_data['model']
+    device = next(model.parameters()).device
+    
+    # 检测是否使用bf16或fp16
+    using_bf16 = model.dtype == torch.bfloat16 or model.dtype == torch.float16
+    
+    embeddings = []
+    
+    # 处理文本格式
+    if task_description:
+        # 如果提供了任务描述，构建指令格式的查询
+        processed_texts = [get_detailed_instruct(task_description, text) for text in texts]
+    else:
+        processed_texts = texts
+    
+    # 批量处理
+    for i in range(0, len(processed_texts), batch_size):
+        batch_texts = processed_texts[i:i+batch_size]
+        
+        # 使用tokenizer处理文本
+        batch_dict = tokenizer(
+            batch_texts, 
+            max_length=max_length, 
+            padding=True, 
+            truncation=True, 
+            return_tensors='pt'
+        ).to(device)
+        
+        # 模型推理
+        with torch.no_grad():
+            if using_bf16:
+                # 使用autocast以确保在使用bf16/fp16时不会出现精度问题
+                with torch.autocast(device_type=device.type):
+                    outputs = model(**batch_dict)
+            else:
+                outputs = model(**batch_dict)
+            
+        # 处理模型输出，获取嵌入向量
+        batch_embeddings = last_token_pool(outputs.last_hidden_state, batch_dict['attention_mask'])
+        
+        # 标准化嵌入向量
+        batch_embeddings = F.normalize(batch_embeddings, p=2, dim=1)
+        
+        # 转为CPU并添加到结果列表
+        embeddings.append(batch_embeddings.cpu().numpy())
+    
+    # 合并所有批次的结果
+    embeddings = np.vstack(embeddings)
+    
+    # 清理GPU缓存，释放内存
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        
+    return embeddings
+
+
 def process_and_save(
         dataloader, 
         model, 
@@ -158,7 +254,10 @@ def process_and_save(
         save_every=100, 
         start_batch=0, 
         storage_format='h5', 
-        numpy_save_interval=10
+        numpy_save_interval=10,
+        use_transformers=False,
+        task_description=None,
+        max_length=4096
     ):
     """处理数据并保存嵌入向量和元数据"""
     os.makedirs(output_dir, exist_ok=True)
@@ -205,8 +304,12 @@ def process_and_save(
             metadata = batch['metadata']
             
             # 生成嵌入
-            title_embeddings = generate_embeddings(model, titles, batch_size)
-            abstract_embeddings = generate_embeddings(model, abstracts, batch_size)
+            if use_transformers:
+                title_embeddings = generate_embeddings_transformers(model, titles, batch_size, max_length, task_description)
+                abstract_embeddings = generate_embeddings_transformers(model, abstracts, batch_size, max_length, task_description)
+            else:
+                title_embeddings = generate_embeddings(model, titles, batch_size)
+                abstract_embeddings = generate_embeddings(model, abstracts, batch_size)
             
             # 保存数据
             for i in range(len(ids)):
@@ -328,13 +431,23 @@ def process_and_save(
                 
                 # 保存当前元数据，作为备份
                 with open(metadata_file + ".temp", 'w', encoding='utf-8') as f:
+                    # 安全地获取模型名称
+                    if use_transformers:
+                        model_name = model['model'].config._name_or_path
+                    else:
+                        try:
+                            model_name = getattr(getattr(model._first_module(), 'auto_model', None).config, '_name_or_path', '')
+                        except (AttributeError, TypeError):
+                            model_name = str(model.__class__.__name__)
+                            
                     json.dump({
                         'papers': all_metadata,
                         'id_to_index': {paper_id: idx for idx, paper_id in enumerate(all_ids)},
                         'embedding_info': {
-                            'model': getattr(getattr(model._first_module(), 'auto_model', None).config, '_name_or_path', ''),
+                            'model': model_name,
                             'embedding_dim': title_embeddings.shape[1],
-                            'creation_date': datetime.now().isoformat()
+                            'creation_date': datetime.now().isoformat(),
+                            'use_transformers': use_transformers
                         }
                     }, f, ensure_ascii=False, indent=4)
         
@@ -346,13 +459,23 @@ def process_and_save(
         
         # 保存最终元数据
         with open(metadata_file, 'w', encoding='utf-8') as f:
+            # 安全地获取模型名称
+            if use_transformers:
+                model_name = model['model'].config._name_or_path
+            else:
+                try:
+                    model_name = getattr(getattr(model._first_module(), 'auto_model', None).config, '_name_or_path', '')
+                except (AttributeError, TypeError):
+                    model_name = str(model.__class__.__name__)
+                    
             json.dump({
                 'papers': all_metadata,
                 'id_to_index': {paper_id: idx for idx, paper_id in enumerate(all_ids)},
                 'embedding_info': {
-                    'model': getattr(getattr(model._first_module(), 'auto_model', None).config, '_name_or_path', ''),
+                    'model': model_name,
                     'embedding_dim': title_embeddings.shape[1],
-                    'creation_date': datetime.now().isoformat()
+                    'creation_date': datetime.now().isoformat(),
+                    'use_transformers': use_transformers
                 }
             }, f, ensure_ascii=False, indent=2)
         
@@ -364,6 +487,16 @@ def process_and_save(
             h5_file.close()
     
     return processed_count, metadata_file, embedding_files
+
+
+def validate_args(args):
+    """验证命令行参数的合法性和兼容性"""
+    if args.use_transformers and args.model_attn_implementation == "flash_attention_2" and not args.bf16:
+        logging.warning("注意：Flash Attention 2只支持bf16和fp16精度，将自动启用bf16精度")
+    
+    if not args.use_transformers and args.use_flash_attention:
+        logging.warning("注意：sentence-transformers不支持flash-attention，此参数在非use_transformers模式下将被忽略")
+        logging.warning("如需使用flash-attention，请添加--use_transformers参数")
 
 
 def main():
@@ -400,10 +533,24 @@ def main():
                        help="当使用numpy格式时，每处理多少批次保存一次到磁盘，避免内存溢出")
     parser.add_argument("--num_workers", type=int, default=4,
                        help="DataLoader的工作进程数")
+    
+    # transformers相关参数
+    parser.add_argument("--use_transformers", action="store_true",
+                       help="使用transformers库替代sentence-transformers，支持更多优化选项如flash-attention")
     parser.add_argument("--use_flash_attention", action="store_true",
-                       help="启用Flash Attention加速（如果可用）")
+                       help="启用Flash Attention加速（仅在use_transformers=True时有效）")
+    parser.add_argument("--task_description", type=str, default=None,
+                       help="任务描述，用于构建指令格式的查询（仅在use_transformers=True时有效）")
+    parser.add_argument("--bf16", action="store_true",
+                       help="使用BF16精度而不是FP32精度，可以提高性能和减少内存使用（仅在use_transformers=True时有效）")
+    parser.add_argument("--model_attn_implementation", type=str, default="eager",
+                       choices=["eager", "sdpa", "flash_attention_2"],
+                       help="模型注意力实现方式（仅在use_transformers=True时有效）")
     
     args = parser.parse_args()
+    
+    # 验证命令行参数
+    validate_args(args)
     
     # 设置日志
     log_level = getattr(logging, args.log_level)
@@ -423,20 +570,59 @@ def main():
     
     # 加载模型
     logging.info(f"加载模型: {args.model_path}")
-    if args.use_flash_attention:
-        try:
-            model = SentenceTransformer(args.model_path, use_flash_attention=True)
-            logging.info("已启用Flash Attention和FP32计算")
-        except Exception as e:
-            logging.warning(f"启用Flash Attention失败: {e}")
-            model = SentenceTransformer(args.model_path)
-            logging.info("已启用FP32计算")
-    else:
-        model = SentenceTransformer(args.model_path)
-        logging.info("已启用FP32计算")
+    
+    # 判断是使用transformers还是sentence-transformers
+    if args.use_transformers:
+        model_kwargs = {}
+        if torch.cuda.is_available():
+            # 精度设置
+            torch_dtype = torch.bfloat16 if args.bf16 else torch.float32
+            model_kwargs["torch_dtype"] = torch_dtype
+            
+            # 注意力机制设置
+            if args.model_attn_implementation != "eager":
+                model_kwargs["attn_implementation"] = args.model_attn_implementation
+                if args.model_attn_implementation == "flash_attention_2":
+                    logging.info("使用Flash Attention 2进行加速")
+                    # Flash Attention只支持bf16或fp16，如果用户没有明确指定bf16，则在这里强制设置
+                    if not args.bf16:
+                        logging.warning("Flash Attention 2只支持bf16或fp16精度，自动启用bf16精度")
+                        model_kwargs["torch_dtype"] = torch.bfloat16
+                        args.bf16 = True  # 更新参数，以便后续日志显示正确的精度信息
         
-    model.max_seq_length = args.max_seq_length
-    model.to(device)
+        try:
+            # 加载tokenizer和模型
+            tokenizer = AutoTokenizer.from_pretrained(args.model_path)
+            model = AutoModel.from_pretrained(args.model_path, **model_kwargs)
+            model.to(device)
+            
+            # 将tokenizer和model打包为一个字典，方便传递
+            model_data = {
+                'tokenizer': tokenizer,
+                'model': model
+            }
+            
+            precision_info = "BF16" if args.bf16 else "FP32"
+            logging.info(f"已加载transformers模型，使用{precision_info}精度和{args.model_attn_implementation}注意力机制")
+        except Exception as e:
+            logging.error(f"加载transformers模型失败: {e}")
+            raise
+    else:
+        try:
+            # sentence-transformers不支持flash-attention，忽略use_flash_attention参数
+            model = SentenceTransformer(args.model_path)
+            logging.info("已加载SentenceTransformer模型，使用FP32计算")
+            
+            if args.use_flash_attention:
+                logging.warning("注意：sentence-transformers不支持flash-attention，此参数在非use_transformers模式下将被忽略")
+                logging.warning("如需使用flash-attention，请添加--use_transformers参数")
+                
+            model.max_seq_length = args.max_seq_length
+            model.to(device)
+            model_data = model  # 兼容两种API
+        except Exception as e:
+            logging.error(f"加载SentenceTransformer模型失败: {e}")
+            raise
     
     # 加载数据集
     dataset = ArxivDataset(args.input_file, start_idx=args.start_idx, max_samples=args.max_samples)
@@ -472,13 +658,16 @@ def main():
     start_time = time.time()
     processed_count, metadata_file, embedding_files = process_and_save(
         dataloader, 
-        model, 
+        model_data, 
         args.output_dir, 
         batch_size=args.batch_size,
         save_every=args.save_every,
         start_batch=args.start_batch,
         storage_format=args.storage_format,
-        numpy_save_interval=args.numpy_save_interval
+        numpy_save_interval=args.numpy_save_interval,
+        use_transformers=args.use_transformers,
+        task_description=args.task_description,
+        max_length=args.max_seq_length
     )
     
     # 输出文件信息
