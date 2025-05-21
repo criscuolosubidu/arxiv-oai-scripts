@@ -129,6 +129,8 @@ python analyze_arxiv_oai.py --analyze_length --input_file data/filtered_data.jso
 - 支持HDF5和NumPy两种存储格式
 - 提供断点续传功能
 - 支持自定义批处理大小和处理参数
+- 支持使用sentence-transformers或transformers库生成嵌入向量
+- 支持Flash Attention 2加速（transformers模式）
 
 #### 命令行参数
 
@@ -148,29 +150,35 @@ python analyze_arxiv_oai.py --analyze_length --input_file data/filtered_data.jso
 --storage_format        嵌入向量存储格式: h5 (HDF5) 或 numpy
 --numpy_save_interval   当使用numpy格式时，每处理多少批次保存一次
 --num_workers           DataLoader的工作进程数
---use_flash_attention   启用Flash Attention加速
+
+# transformers相关参数
+--use_transformers          使用transformers库替代sentence-transformers，支持更多优化选项
+--use_flash_attention       启用Flash Attention加速（仅在use_transformers=True时有效）
+--task_description          任务描述，用于构建指令格式的查询（仅在use_transformers=True时有效）
+--bf16                      使用BF16精度而不是FP32精度（仅在use_transformers=True时有效）
+--model_attn_implementation 模型注意力实现方式（选项：eager, sdpa, flash_attention_2）
 ```
 
 #### 使用示例
 
-基本用法：
+基本用法（使用sentence-transformers）：
 ```bash
 python generate_embeddings_arxiv_oai.py --input_file data/arxiv-metadata-oai-snapshot.json --output_dir data/embeddings
 ```
 
-使用过滤后的高质量数据：
+使用transformers库生成嵌入：
 ```bash
-python generate_embeddings_arxiv_oai.py --input_file data/filtered_data.jsonl
+python generate_embeddings_arxiv_oai.py --input_file data/filtered_data.jsonl --use_transformers
 ```
 
-自定义模型路径：
+使用Flash Attention 2加速：
 ```bash
-python generate_embeddings_arxiv_oai.py --model_path models/my-model
+python generate_embeddings_arxiv_oai.py --use_transformers --model_attn_implementation flash_attention_2 --bf16
 ```
 
-限制处理的样本数量：
+添加任务描述（构建指令格式查询）：
 ```bash
-python generate_embeddings_arxiv_oai.py --max_samples 10000
+python generate_embeddings_arxiv_oai.py --use_transformers --task_description "为学术论文生成搜索嵌入"
 ```
 
 断点续传（从某篇论文继续处理）：

@@ -130,6 +130,8 @@ python analyze_arxiv_oai.py --analyze_length --input_file data/filtered_data.jso
 - 支持HDF5和NumPy两种存储格式
 - 提供断点续传功能
 - 支持自定义批处理大小和处理参数
+- 支持使用sentence-transformers或transformers库生成嵌入向量
+- 支持Flash Attention 2加速（transformers模式）
 
 #### 命令行参数
 
@@ -149,29 +151,35 @@ python analyze_arxiv_oai.py --analyze_length --input_file data/filtered_data.jso
 --storage_format        嵌入向量存储格式: h5 (HDF5) 或 numpy
 --numpy_save_interval   当使用numpy格式时，每处理多少批次保存一次
 --num_workers           DataLoader的工作进程数
---use_flash_attention   启用Flash Attention加速
+
+# transformers相关参数
+--use_transformers          使用transformers库替代sentence-transformers，支持更多优化选项
+--use_flash_attention       启用Flash Attention加速（仅在use_transformers=True时有效）
+--task_description          任务描述，用于构建指令格式的查询（仅在use_transformers=True时有效）
+--bf16                      使用BF16精度而不是FP32精度（仅在use_transformers=True时有效）
+--model_attn_implementation 模型注意力实现方式（选项：eager, sdpa, flash_attention_2）
 ```
 
 #### 使用示例
 
-基本用法：
+基本用法（使用sentence-transformers）：
 ```bash
 python generate_embeddings_arxiv_oai.py --input_file data/arxiv-metadata-oai-snapshot.json --output_dir data/embeddings
 ```
 
-使用过滤后的高质量数据：
+使用transformers库生成嵌入：
 ```bash
-python generate_embeddings_arxiv_oai.py --input_file data/filtered_data.jsonl
+python generate_embeddings_arxiv_oai.py --input_file data/filtered_data.jsonl --use_transformers
 ```
 
-自定义模型路径：
+使用Flash Attention 2加速：
 ```bash
-python generate_embeddings_arxiv_oai.py --model_path models/my-model
+python generate_embeddings_arxiv_oai.py --use_transformers --model_attn_implementation flash_attention_2 --bf16
 ```
 
-限制处理的样本数量：
+添加任务描述（构建指令格式查询）：
 ```bash
-python generate_embeddings_arxiv_oai.py --max_samples 10000
+python generate_embeddings_arxiv_oai.py --use_transformers --task_description "为学术论文生成搜索嵌入"
 ```
 
 断点续传（从某篇论文继续处理）：
@@ -199,22 +207,31 @@ python generate_embeddings_arxiv_oai.py --batch_size 32 --data_batch_size 64
 - 验证H5文件中ID的顺序与元数据中的索引是否匹配
 - 通过重新计算随机样本的嵌入向量来验证嵌入质量
 - 计算原始嵌入与重新计算的嵌入之间的余弦相似度
+- 支持验证使用transformers或sentence-transformers生成的嵌入向量
+- 自动检测元数据中的嵌入生成方式，并使用相应的验证方法
 
 #### 命令行参数
 
 ```
---h5_file              H5文件路径，包含嵌入向量（必需）
---metadata_file        元数据JSON文件路径（必需）
---model_path           用于生成嵌入向量的模型路径，必须与原始模型相同（必需）
---num_samples          要验证的随机样本数量（默认：10）
---batch_size           验证时的批处理大小（默认：2）
---log_level            日志级别（默认：INFO）
---use_flash_attention  启用Flash Attention加速（如果可用）
+--h5_file                   H5文件路径，包含嵌入向量（必需）
+--metadata_file             元数据JSON文件路径（必需）
+--model_path                用于生成嵌入向量的模型路径，必须与原始模型相同（必需）
+--num_samples               要验证的随机样本数量（默认：10）
+--batch_size                验证时的批处理大小（默认：2）
+--max_length                最大序列长度（默认：4096）
+--log_level                 日志级别（默认：INFO）
+
+# transformers相关参数
+--use_transformers          使用transformers库替代sentence-transformers进行验证
+--use_flash_attention       启用Flash Attention加速（仅在use_transformers=True时有效）
+--task_description          任务描述，用于构建指令格式的查询（仅在use_transformers=True时有效）
+--bf16                      使用BF16精度而不是FP32精度（仅在use_transformers=True时有效）
+--model_attn_implementation 模型注意力实现方式（选项：eager, sdpa, flash_attention_2）
 ```
 
 #### 使用示例
 
-基础验证：
+基础验证（使用sentence-transformers）：
 ```bash
 python verify_embeddings.py \
     --h5_file data/arxiv/embeddings/arxiv_embeddings_20230101_123456.h5 \
@@ -222,23 +239,34 @@ python verify_embeddings.py \
     --model_path models/e5-mistral-7b-instruct/
 ```
 
-增加样本数量和调试级别：
+验证transformers生成的向量：
 ```bash
 python verify_embeddings.py \
     --h5_file data/arxiv/embeddings/arxiv_embeddings_20230101_123456.h5 \
     --metadata_file data/arxiv/embeddings/arxiv_metadata_20230101_123456.json \
     --model_path models/e5-mistral-7b-instruct/ \
-    --num_samples 20 \
-    --log_level DEBUG
+    --use_transformers
 ```
 
-使用Flash Attention加速：
+使用Flash Attention 2验证：
 ```bash
 python verify_embeddings.py \
     --h5_file data/arxiv/embeddings/arxiv_embeddings_20230101_123456.h5 \
     --metadata_file data/arxiv/embeddings/arxiv_metadata_20230101_123456.json \
     --model_path models/e5-mistral-7b-instruct/ \
-    --use_flash_attention
+    --use_transformers \
+    --model_attn_implementation flash_attention_2 \
+    --bf16
+```
+
+验证带任务描述的嵌入：
+```bash
+python verify_embeddings.py \
+    --h5_file data/arxiv/embeddings/arxiv_embeddings_20230101_123456.h5 \
+    --metadata_file data/arxiv/embeddings/arxiv_metadata_20230101_123456.json \
+    --model_path models/e5-mistral-7b-instruct/ \
+    --use_transformers \
+    --task_description "为学术论文生成搜索嵌入"
 ```
 
 ### 4. 探索嵌入向量 (explore_h5_embeddings.py)
