@@ -250,11 +250,15 @@ def process_and_save(
                     id_dtype = h5py.special_dtype(vlen=str)
                     h5_file.create_dataset(
                         'paper_ids', 
-                        data=np.array(ids), 
+                        data=np.array(ids, dtype=object), 
                         maxshape=(None,), 
                         dtype=id_dtype, 
                         chunks=True
                     )
+                    
+                    # 添加第一个批次的数据
+                    title_emb_dataset[:] = title_embeddings
+                    abstract_emb_dataset[:] = abstract_embeddings
                 else:
                     # 扩展数据集
                     current_size = title_emb_dataset.shape[0]
@@ -328,7 +332,7 @@ def process_and_save(
                         'papers': all_metadata,
                         'id_to_index': {paper_id: idx for idx, paper_id in enumerate(all_ids)},
                         'embedding_info': {
-                            'model': model.get_config_dict().get('model_name_or_path', ''),
+                            'model': getattr(getattr(model._first_module(), 'auto_model', None).config, '_name_or_path', ''),
                             'embedding_dim': title_embeddings.shape[1],
                             'creation_date': datetime.now().isoformat()
                         }
@@ -346,7 +350,7 @@ def process_and_save(
                 'papers': all_metadata,
                 'id_to_index': {paper_id: idx for idx, paper_id in enumerate(all_ids)},
                 'embedding_info': {
-                    'model': model.get_config_dict().get('model_name_or_path', ''),
+                    'model': getattr(getattr(model._first_module(), 'auto_model', None).config, '_name_or_path', ''),
                     'embedding_dim': title_embeddings.shape[1],
                     'creation_date': datetime.now().isoformat()
                 }

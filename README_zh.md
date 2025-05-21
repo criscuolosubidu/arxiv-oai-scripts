@@ -1,11 +1,12 @@
 # arXiv-oai-scripts
 
-这个项目提供了一套工具，用于处理和分析arXiv论文数据集，以及生成论文摘要和标题的语义嵌入向量。
+本项目提供了一套工具，用于处理和分析arXiv论文数据集，以及生成论文摘要和标题的语义嵌入向量。
 
 ## 文件结构
 
 ```
-├── README.md                           # 项目说明文档
+├── README.md                           # 项目说明文档（英文）
+├── README_zh.md                        # 项目说明文档（中文）
 ├── analyze_arxiv_oai.py                # 数据集质量分析与摘要长度分析工具
 ├── generate_embeddings_arxiv_oai.py    # 语义嵌入向量生成工具
 ├── verify_embeddings.py                # 嵌入向量验证工具
@@ -415,4 +416,4 @@ RuntimeWarning: invalid value encountered in scalar divide
 1. 嵌入向量中存在全零向量或范数接近零的向量
 2. 重新计算的嵌入向量与存储的嵌入向量差异较大
 
-此时，可以使用`compare_embeddings.py`工具来进行更详细的分析，它提供了更强大的向量有效性检查和错误处理机制。
+此时，可以使用`compare_embeddings.py`工具来进行更详细的分析，它提供了更强大的向量有效性检查和错误处理机制。 
