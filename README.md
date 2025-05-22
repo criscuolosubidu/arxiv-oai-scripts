@@ -1,14 +1,16 @@
 # arXiv-oai-scripts
 
-这个项目提供了一套工具，用于处理和分析arXiv论文数据集，以及生成论文摘要和标题的语义嵌入向量。
+这个项目提供了一套脚本，用于处理和分析arXiv论文的OAI数据集，以及生成论文摘要和标题的语义嵌入向量。
 
 ## 文件结构
 
 ```
 ├── README.md                           # 项目说明文档
 ├── analyze_arxiv_oai.py                # 数据集质量分析与摘要长度分析工具
-├── generate_embeddings_arxiv_oai.py    # 语义嵌入向量生成工具
+├── generate_embeddings_arxiv_oai.py    # 语义嵌入向量生成工具（sentence-transformers，transformers）
+├── generate_embeddings_with_tei.py     # 使用TEI服务生成语义嵌入向量工具
 ├── verify_embeddings.py                # 嵌入向量验证工具
+├── verify_embeddings_tei.py            # TEI嵌入向量验证工具
 ├── explore_h5_embeddings.py            # 嵌入向量探索工具
 ├── compare_embeddings.py               # 嵌入向量比较工具
 ├── download_files.py                   # 数据集下载工具
@@ -22,7 +24,7 @@
 ├── logs/                               # 日志文件目录
 └── models/                             # 预训练模型目录
     ├── e5-mistral-7b-instruct/        # E5-Mistral-7B模型
-    └── jina-embedding-v3/             # JINA嵌入模型
+    └── jina-embedding-v3/             # JINA嵌入模型（中英文的数据集选择这个）
 ```
 
 ## 数据来源
@@ -32,15 +34,17 @@ arXiv论文数据集可从以下地址获取：
 
 ## 工具概述
 
-项目包含以下主要工具：
+项目包含以下脚本：
 
 1. **analyze_arxiv_oai.py**: 用于分析arXiv数据集的质量和统计特征，包括检查必要字段、过滤无效数据以及分析摘要长度
 2. **generate_embeddings_arxiv_oai.py**: 用于为arXiv论文的标题和摘要生成语义嵌入向量
-3. **verify_embeddings.py**: 用于验证生成的嵌入向量与元数据的一致性和质量
-4. **explore_h5_embeddings.py**: 用于探索和查看H5文件中的嵌入向量内容
-5. **compare_embeddings.py**: 用于比较两个不同的嵌入向量文件的相似度
+3. **generate_embeddings_with_tei.py**: 通过TEI服务生成语义嵌入向量
+4. **verify_embeddings.py**: 用于验证生成的嵌入向量与元数据的一致性和质量
+5. **verify_embeddings_tei.py**: 验证TEI生成的嵌入向量
+6. **explore_h5_embeddings.py**: 用于探索和查看H5文件中的嵌入向量内容
+7. **compare_embeddings.py**: 用于比较两个不同的嵌入向量文件的相似度
 
-此外，项目还包含以下辅助工具：
+此外，项目还包含以下辅助脚本：
 - **download_files.py**: 用于从网络下载必要的数据文件
 - **parse_files.py**: 解析处理下载的数据文件
 - **unzip_files.py**: 解压缩数据文件
@@ -62,7 +66,7 @@ pip install -r requirements.txt
 
 ### 1. 数据集质量分析与过滤 (analyze_arxiv_oai.py)
 
-这个工具可以检查数据集中必要字段的完整性，过滤无效数据，分析摘要长度分布等。
+此脚本可以检查数据集中必要字段的完整性，过滤无效数据，分析摘要长度分布等。
 
 #### 主要功能
 
@@ -121,7 +125,7 @@ python analyze_arxiv_oai.py --analyze_length --input_file data/filtered_data.jso
 
 ### 2. 生成语义嵌入向量 (generate_embeddings_arxiv_oai.py)
 
-这个工具使用E5-Mistral-7B模型为arXiv论文的标题和摘要生成语义嵌入向量。
+此脚本使用E5-Mistral-7B模型为arXiv论文的标题和摘要生成语义嵌入向量。
 
 #### 主要功能
 
@@ -196,9 +200,117 @@ python generate_embeddings_arxiv_oai.py --storage_format numpy
 python generate_embeddings_arxiv_oai.py --batch_size 32 --data_batch_size 64
 ```
 
-### 3. 验证嵌入向量 (verify_embeddings.py)
+### 3. 使用TEI服务生成语义嵌入向量 (generate_embeddings_with_tei.py)
 
-此工具用于验证H5文件中的嵌入向量是否与元数据一一对应，并且检查嵌入向量的质量。
+此脚本通过HTTP API调用本地部署的Text Embedding Inference (TEI)服务，为arXiv论文的标题和摘要生成语义嵌入向量。TEI提供了极高性能的文本嵌入服务，可以部署各种热门的嵌入模型（注意某些模型可能是不支持的，大部分的顶尖热门模型应该都支持了）。
+
+#### 部署TEI
+
+详细的部署流程参考官方教程 [text-embeddings-inference](https://github.com/huggingface/text-embeddings-inference)。
+
+推荐使用docker部署，下面是一个参考的脚本：
+
+```bash
+git clone https://github.com/huggingface/text-embeddings-inference
+cd text-embeddings-inference
+vim run.sh
+```
+
+将下面的内容写入到`run.sh`中：
+
+```bash
+model="./data/e5-mistral-7b-instruct" # 需要将模型放到挂在的data文件夹下，这里建议提前下载好
+volume="$PWD/data"
+docker run --gpus all -p 8080:80 -v $volume:/data \
+    --pull always ghcr.io/huggingface/text-embeddings-inference:89-1.7 \
+    --model-id $model \
+    --pooling last-token # 使用 intfloat/e5-mistral-7b-instruct 官方例子中的last-token的方法
+```
+
+然后启动：
+
+```bash
+chmod +x run.sh
+sudo ./run.sh
+```
+
+#### 主要功能
+
+- 使用TEI服务生成论文标题和摘要的嵌入向量
+- 支持HDF5和NumPy两种存储格式
+- 完全并行处理，最大化利用TEI服务性能
+- 支持断点续传和进度保存
+- 实时估计处理速度和剩余时间
+- 支持提示词前缀(prompt name)自定义
+
+#### 命令行参数
+
+```
+--input_file           arXiv元数据JSON文件路径
+--output_dir           嵌入向量输出目录
+--log_dir              日志输出目录
+--tei_url              TEI服务URL
+--max_workers          并行工作线程最大数量
+--save_every           每处理多少篇论文保存一次进度
+--start_idx            从哪篇论文开始处理
+--max_samples          最多处理多少篇论文，None表示处理所有
+--log_level            日志级别
+--storage_format       嵌入向量存储格式: h5 (HDF5) 或 numpy
+--prompt_name          TEI服务的提示名称前缀（可选）
+```
+
+#### 使用示例
+
+基本用法：
+```bash
+python generate_embeddings_with_tei.py \
+    --input_file data/arxiv/arxiv-metadata-oai-snapshot.json \
+    --output_dir data/arxiv/embeddings
+```
+
+指定TEI服务URL：
+```bash
+python generate_embeddings_with_tei.py \
+    --input_file data/arxiv/arxiv-metadata-oai-snapshot.json \
+    --output_dir data/arxiv/embeddings \
+    --tei_url http://localhost:8080/embed
+```
+
+增加并行线程以提高处理速度：
+```bash
+python generate_embeddings_with_tei.py \
+    --input_file data/arxiv/arxiv-metadata-oai-snapshot.json \
+    --output_dir data/arxiv/embeddings \
+    --max_workers 32
+```
+
+断点续传（从某篇论文继续处理）：
+```bash
+python generate_embeddings_with_tei.py \
+    --input_file data/arxiv/arxiv-metadata-oai-snapshot.json \
+    --output_dir data/arxiv/embeddings \
+    --start_idx 50000
+```
+
+使用NumPy格式存储嵌入向量：
+```bash
+python generate_embeddings_with_tei.py \
+    --input_file data/arxiv/arxiv-metadata-oai-snapshot.json \
+    --output_dir data/arxiv/embeddings \
+    --storage_format numpy
+```
+
+添加提示词前缀：
+```bash
+python generate_embeddings_with_tei.py \
+    --input_file data/arxiv/arxiv-metadata-oai-snapshot.json \
+    --output_dir data/arxiv/embeddings \
+    --prompt_name "Represent this document for retrieval: "
+```
+
+### 4. 验证嵌入向量 (verify_embeddings.py)
+
+此脚本用于验证H5文件中的嵌入向量是否与元数据一一对应，并且检查嵌入向量的质量。
 
 #### 主要功能
 
@@ -248,9 +360,68 @@ python verify_embeddings.py \
     --use_flash_attention
 ```
 
-### 4. 探索嵌入向量 (explore_h5_embeddings.py)
+### 5. 验证TEI生成的嵌入向量 (verify_embeddings_tei.py)
 
-此工具用于直接探索和查看H5文件中的嵌入向量内容，提供统计信息和可视化功能。
+此脚本用于验证使用TEI服务生成的嵌入向量是否与元数据一一对应，并检查嵌入向量的质量。它通过调用相同的TEI服务重新生成部分嵌入向量并比较相似度来实现验证。
+
+#### 主要功能
+
+- 检查H5文件和元数据中的论文ID是否一致
+- 验证H5文件中ID的顺序与元数据中的索引是否匹配
+- 通过TEI服务重新计算随机样本的嵌入向量来验证嵌入质量
+- 计算原始嵌入与重新计算的嵌入之间的余弦相似度
+
+#### 命令行参数
+
+```
+--h5_file              H5文件路径，包含嵌入向量（必需）
+--metadata_file        元数据JSON文件路径（必需）
+--tei_url              TEI服务URL（默认：http://127.0.0.1:8080/embed）
+--num_samples          要验证的随机样本数量（默认：10）
+--prompt_name          TEI服务的提示名称，如果为None则从元数据中读取
+--max_retries          调用TEI服务的最大重试次数（默认：3）
+--retry_delay          调用TEI服务的重试间隔（秒）（默认：1）
+--log_level            日志级别（默认：INFO）
+```
+
+#### 使用示例
+
+基础验证：
+```bash
+python verify_embeddings_tei.py \
+    --h5_file data/arxiv/embeddings/arxiv_embeddings_tei_20230101_123456.h5 \
+    --metadata_file data/arxiv/embeddings/arxiv_metadata_tei_20230101_123456.json
+```
+
+增加样本数量和指定TEI服务URL：
+```bash
+python verify_embeddings_tei.py \
+    --h5_file data/arxiv/embeddings/arxiv_embeddings_tei_20230101_123456.h5 \
+    --metadata_file data/arxiv/embeddings/arxiv_metadata_tei_20230101_123456.json \
+    --tei_url http://localhost:8080/embed \
+    --num_samples 20
+```
+
+指定提示词前缀：
+```bash
+python verify_embeddings_tei.py \
+    --h5_file data/arxiv/embeddings/arxiv_embeddings_tei_20230101_123456.h5 \
+    --metadata_file data/arxiv/embeddings/arxiv_metadata_tei_20230101_123456.json \
+    --prompt_name "Represent this document for retrieval: "
+```
+
+增加重试次数和延迟：
+```bash
+python verify_embeddings_tei.py \
+    --h5_file data/arxiv/embeddings/arxiv_embeddings_tei_20230101_123456.h5 \
+    --metadata_file data/arxiv/embeddings/arxiv_metadata_tei_20230101_123456.json \
+    --max_retries 5 \
+    --retry_delay 2
+```
+
+### 6. 探索嵌入向量 (explore_h5_embeddings.py)
+
+此脚本用于直接探索和查看H5文件中的嵌入向量内容，提供统计信息和可视化功能。
 
 #### 主要功能
 
@@ -305,7 +476,7 @@ python explore_h5_embeddings.py \
     --plot_pca
 ```
 
-### 5. 比较不同嵌入向量 (compare_embeddings.py)
+### 7. 比较不同嵌入向量 (compare_embeddings.py)
 
 这个工具用于比较两个不同的H5文件中的嵌入向量，分析它们之间的相似度和差异。特别适用于比较不同模型或参数设置生成的嵌入向量。
 
@@ -395,8 +566,12 @@ python compare_embeddings.py \
 
 1. 先使用`analyze_arxiv_oai.py`检查数据质量并过滤无效数据
 2. 对过滤后的数据进行摘要长度分析，了解数据特征
-3. 使用`generate_embeddings_arxiv_oai.py`为高质量数据生成嵌入向量
-4. 用`verify_embeddings.py`验证生成的嵌入向量质量
+3. 根据需要选择不同的嵌入生成方式：
+   - 使用`generate_embeddings_arxiv_oai.py`直接在本地生成嵌入向量
+   - 或使用`generate_embeddings_with_tei.py`通过TEI服务生成嵌入向量
+4. 使用相应的验证工具验证生成的嵌入向量质量：
+   - 使用`verify_embeddings.py`验证通过transformers或sentence-transformers生成的向量
+   - 使用`verify_embeddings_tei.py`验证通过TEI服务生成的向量
 5. 使用`explore_h5_embeddings.py`探索嵌入向量的特性
 6. 如需比较不同模型或参数生成的嵌入向量，使用`compare_embeddings.py`
 7. 基于验证良好的嵌入向量构建语义搜索或推荐系统
@@ -405,6 +580,7 @@ python compare_embeddings.py \
 
 - 摘要长度分析支持多进程处理，推荐在大型数据集上使用
 - 嵌入向量生成可通过调整`batch_size`和`num_workers`优化性能
+- 使用TEI服务时，增加`max_workers`参数可显著提高处理速度
 - 对于非常大的数据集，建议使用`--max_samples`先在子集上测试
 - HDF5格式更节省存储空间，NumPy格式更灵活但占用空间较大
 - 在比较大型嵌入向量文件时，可以使用`--num_samples`选项限制样本数量，提高比较速度
