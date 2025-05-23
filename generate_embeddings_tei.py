@@ -246,14 +246,18 @@ async def process_single_paper_with_semaphore(paper, tei_url, prompt_name, semap
             async with aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=60)
             ) as session:
-                # 并发处理标题和摘要
-                title_task = call_tei_service_async(session, paper['title'], tei_url, prompt_name)
-                abstract_task = call_tei_service_async(session, paper['abstract'], tei_url, prompt_name)
-                
-                title_embedding = await title_task
-                abstract_embedding = await abstract_task
-                
-                return paper['id'], title_embedding, abstract_embedding
+                # 使用 asyncio.gather 并发处理标题和摘要，确保异常时所有协程都被正确处理
+                try:
+                    title_embedding, abstract_embedding = await asyncio.gather(
+                        call_tei_service_async(session, paper['title'], tei_url, prompt_name),
+                        call_tei_service_async(session, paper['abstract'], tei_url, prompt_name),
+                        return_exceptions=False  # 遇到异常时立即抛出，确保清理
+                    )
+                    return paper['id'], title_embedding, abstract_embedding
+                except Exception as e:
+                    # 这里的异常处理确保了所有协程都被正确等待和清理
+                    logging.error(f"处理论文 {paper['id']} 的嵌入时出错: {str(e)}")
+                    return None
     except Exception as e:
         logging.error(f"处理论文 {paper['id']} 时出错: {str(e)}")
         return None
