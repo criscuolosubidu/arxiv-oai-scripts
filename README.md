@@ -224,7 +224,7 @@ volume="$PWD/data"
 docker run --gpus all -p 8080:80 -v $volume:/data \
     --pull always ghcr.io/huggingface/text-embeddings-inference:89-1.7 \
     --model-id $model \
-    --pooling last-token # 使用 intfloat/e5-mistral-7b-instruct 官方例子中的last-token的方法
+    --pooling mean 
 ```
 
 然后启动：
