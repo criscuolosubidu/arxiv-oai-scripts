@@ -2,8 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-使用TEI服务生成arXiv论文的语义嵌入 - 内存优化版本V3
-平衡GPU吞吐量与内存管理：优化批次大小以充分利用40t/s的TEI性能
+使用TEI服务生成arXiv论文的语义嵌入 
 """
 
 import json
@@ -239,89 +238,35 @@ class HDF5Writer:
             self.h5_file.close()
 
 
-async def process_batch_async(batch_papers, tei_url, prompt_name=None, max_concurrent=10):
-    """异步批次处理，充分利用GPU并发能力"""
-    
-    async with aiohttp.ClientSession(
-        timeout=aiohttp.ClientTimeout(total=60),
-        connector=aiohttp.TCPConnector(limit=max_concurrent)
-    ) as session:
-        
-        # 创建所有任务，保持与原始论文的对应关系
-        tasks = []
-        for i, paper in enumerate(batch_papers):
-            # 为每篇论文创建标题和摘要的嵌入任务
-            title_task = call_tei_service_async(session, paper['title'], tei_url, prompt_name)
-            abstract_task = call_tei_service_async(session, paper['abstract'], tei_url, prompt_name)
-            tasks.append((i, paper, title_task, abstract_task))
-        
-        # 收集结果，保证一一对应
-        results = [None] * len(batch_papers)  # 预分配结果数组
-        
-        for i, paper, title_task, abstract_task in tasks:
-            try:
+async def process_single_paper_with_semaphore(paper, tei_url, prompt_name, semaphore):
+    """带信号量控制的单篇论文处理"""
+    try:
+        async with semaphore:
+            # 创建会话用于这个请求
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=60)
+            ) as session:
+                # 并发处理标题和摘要
+                title_task = call_tei_service_async(session, paper['title'], tei_url, prompt_name)
+                abstract_task = call_tei_service_async(session, paper['abstract'], tei_url, prompt_name)
+                
                 title_embedding = await title_task
                 abstract_embedding = await abstract_task
-                results[i] = (paper['id'], title_embedding, abstract_embedding)
-            except Exception as e:
-                logging.error(f"处理论文 {paper['id']} 时出错: {str(e)}")
-                results[i] = None  # 失败的论文用None占位
-        
-        # 过滤掉失败的结果，但保持成功结果的一一对应
-        batch_ids = []
-        batch_title_embeddings = []
-        batch_abstract_embeddings = []
-        
-        for result in results:
-            if result is not None:
-                paper_id, title_embedding, abstract_embedding = result
-                batch_ids.append(paper_id)
-                batch_title_embeddings.append(title_embedding)
-                batch_abstract_embeddings.append(abstract_embedding)
-        
-        return batch_ids, batch_title_embeddings, batch_abstract_embeddings
+                
+                return paper['id'], title_embedding, abstract_embedding
+    except Exception as e:
+        logging.error(f"处理论文 {paper['id']} 时出错: {str(e)}")
+        return None
 
 
-def process_batch_sync(batch_papers, tei_url, prompt_name=None, max_workers=10):
-    """同步批次处理，使用线程池并发"""
-    
-    def process_single_paper(paper):
-        try:
-            title_embedding = call_tei_service_sync(paper['title'], tei_url, prompt_name)
-            abstract_embedding = call_tei_service_sync(paper['abstract'], tei_url, prompt_name)
-            return paper['id'], title_embedding, abstract_embedding
-        except Exception as e:
-            logging.error(f"处理论文 {paper['id']} 时出错: {str(e)}")
-            return None
-    
-    # 使用线程池处理，保持顺序
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        results = list(executor.map(process_single_paper, batch_papers))
-    
-    # 过滤掉失败的结果，但保持成功结果的一一对应
-    batch_ids = []
-    batch_title_embeddings = []
-    batch_abstract_embeddings = []
-    
-    for result in results:
-        if result is not None:
-            paper_id, title_embedding, abstract_embedding = result
-            batch_ids.append(paper_id)
-            batch_title_embeddings.append(title_embedding)
-            batch_abstract_embeddings.append(abstract_embedding)
-    
-    return batch_ids, batch_title_embeddings, batch_abstract_embeddings
-
-
-async def process_and_save(
+async def stream_process_and_save(
     dataset, 
     tei_url,
     output_dir, 
-    batch_size=80,          
-    save_every=1000,        
+    batch_size=80,                  
     prompt_name=None,
-    use_async=True,
-    max_concurrent=20
+    max_concurrent=20,
+    memory_limit_mb=2048     # 内存限制
 ):
     """流式处理"""
     os.makedirs(output_dir, exist_ok=True)
@@ -330,11 +275,9 @@ async def process_and_save(
     embedding_file = os.path.join(output_dir, f"arxiv_embeddings_{timestamp}.h5")
     metadata_file = os.path.join(output_dir, f"arxiv_metadata_{timestamp}.json")
     
-    logging.info(f"流式处理")
-    logging.info(f"批处理大小: {batch_size}")
-    logging.info(f"每 {save_every} 篇论文保存一次到磁盘")
-    logging.info(f"使用{'异步' if use_async else '同步'}处理")
     logging.info(f"最大并发数: {max_concurrent}")
+    logging.info(f"写入批次大小: {batch_size}")
+    logging.info(f"内存限制: {memory_limit_mb} MB")
     
     # 首先获取嵌入维度
     test_embedding = call_tei_service_sync("TEST TEXT", tei_url, prompt_name)
@@ -346,7 +289,7 @@ async def process_and_save(
     
     start_time = time.time()
     total_processed = 0
-    batch_papers = []
+    completed_results = []
     
     # 用于统计吞吐量
     last_time = start_time
@@ -355,72 +298,75 @@ async def process_and_save(
     # 创建进度条
     pbar = tqdm(desc="处理论文", unit="篇")
     
+    # 信号量控制并发数
+    semaphore = asyncio.Semaphore(max_concurrent)
+    
     try:
-        async for paper in async_stream_papers(dataset):
-            batch_papers.append(paper)
-            
-            # 当批次达到指定大小时处理
-            if len(batch_papers) >= batch_size:
-                batch_start_time = time.time()
-                
-                # 处理当前批次
-                if use_async:
-                    batch_ids, batch_title_embeddings, batch_abstract_embeddings = await process_batch_async(
-                        batch_papers, tei_url, prompt_name, max_concurrent
-                    )
-                else:
-                    batch_ids, batch_title_embeddings, batch_abstract_embeddings = process_batch_sync(
-                        batch_papers, tei_url, prompt_name, max_concurrent
-                    )
-                
-                batch_end_time = time.time()
-                batch_duration = batch_end_time - batch_start_time
-                batch_throughput = len(batch_ids) / batch_duration if batch_duration > 0 else 0
-                
-                if batch_ids:
-                    total_processed += len(batch_ids)
-                    
-                    # 立即写入HDF5文件
-                    hdf5_writer.append_batch(batch_ids, batch_title_embeddings, batch_abstract_embeddings)
-                    
-                    # 立即释放内存
-                    del batch_ids, batch_title_embeddings, batch_abstract_embeddings
-                    gc.collect()
-                    
-                    # 计算当前吞吐量
-                    current_time = time.time()
-                    if current_time - last_time >= 10:  # 每10秒计算一次吞吐量
-                        recent_throughput = (total_processed - last_processed) / (current_time - last_time)
-                        memory_mb = get_memory_usage()
-                        logging.info(f"已处理 {total_processed} 篇论文 | "
-                                   f"批次吞吐量: {batch_throughput:.1f} 篇/秒 | "
-                                   f"平均吞吐量: {recent_throughput:.1f} 篇/秒 | "
-                                   f"内存使用: {memory_mb:.2f} MB")
-                        last_time = current_time
-                        last_processed = total_processed
-                
-                # 清空批次
-                batch_papers.clear()
-                pbar.update(batch_size)
-                
-                # 避免过快请求
-                await asyncio.sleep(0.01)
+        # 创建任务队列
+        pending_tasks = set()
+        paper_iterator = aiter(async_stream_papers(dataset))
+        finished = False
         
-        # 处理最后剩余的论文
-        if batch_papers:
-            if use_async:
-                batch_ids, batch_title_embeddings, batch_abstract_embeddings = await process_batch_async(
-                    batch_papers, tei_url, prompt_name, max_concurrent
-                )
-            else:
-                batch_ids, batch_title_embeddings, batch_abstract_embeddings = process_batch_sync(
-                    batch_papers, tei_url, prompt_name, max_concurrent
-                )
+        while not finished or pending_tasks:
+            # 生产者：持续创建新任务直到达到并发限制
+            while len(pending_tasks) < max_concurrent and not finished:
+                try:
+                    paper = await anext(paper_iterator)
+                    task = asyncio.create_task(
+                        process_single_paper_with_semaphore(paper, tei_url, prompt_name, semaphore)
+                    )
+                    pending_tasks.add(task)
+                except StopAsyncIteration:
+                    finished = True
+                    break
             
-            if batch_ids:
-                hdf5_writer.append_batch(batch_ids, batch_title_embeddings, batch_abstract_embeddings)
-                total_processed += len(batch_ids)
-                del batch_ids, batch_title_embeddings, batch_abstract_embeddings
+            if pending_tasks:
+                # 消费者：等待至少一个任务完成
+                done, pending_tasks = await asyncio.wait(
+                    pending_tasks, 
+                    return_when=asyncio.FIRST_COMPLETED
+                )
+                
+                # 处理完成的任务
+                for completed_task in done:
+                    result = await completed_task
+                    if result:
+                        completed_results.append(result)
+                        total_processed += 1
+                        pbar.update(1)  # 实时更新进度条
+                        
+                        # 检查内存使用并及时写入
+                        current_memory = get_memory_usage()
+                        should_write = (
+                            len(completed_results) >= batch_size or 
+                            current_memory > memory_limit_mb or
+                            (finished and not pending_tasks)  # 最后一批
+                        )
+                        
+                        if should_write and completed_results:
+                            # 批量写入HDF5
+                            batch_ids = [r[0] for r in completed_results]
+                            batch_title_embeddings = [r[1] for r in completed_results]
+                            batch_abstract_embeddings = [r[2] for r in completed_results]
+                            
+                            hdf5_writer.append_batch(batch_ids, batch_title_embeddings, batch_abstract_embeddings)
+                            
+                            # 立即释放内存
+                            del batch_ids, batch_title_embeddings, batch_abstract_embeddings
+                            completed_results.clear()
+                            gc.collect()
+                            
+                            # 计算当前吞吐量
+                            current_time = time.time()
+                            if current_time - last_time >= 10:  # 每10秒计算一次吞吐量
+                                recent_throughput = (total_processed - last_processed) / (current_time - last_time)
+                                memory_mb = get_memory_usage()
+                                logging.info(f"已处理 {total_processed} 篇论文 | "
+                                           f"当前吞吐量: {recent_throughput:.1f} 篇/秒 | "
+                                           f"内存使用: {memory_mb:.2f} MB | "
+                                           f"活跃任务: {len(pending_tasks)}")
+                                last_time = current_time
+                                last_processed = total_processed
         
         pbar.close()
         
@@ -435,12 +381,12 @@ async def process_and_save(
                 'creation_date': datetime.now().isoformat(),
                 'prompt_name': prompt_name,
                 'total_papers': total_processed,
-                'processing_method': 'streaming_gpu_optimized_v3',
+                'processing_method': 'streaming_process',
                 'data_type': 'float16',
                 'compression': 'gzip_level_9',
                 'batch_size': batch_size,
                 'max_concurrent': max_concurrent,
-                'async_processing': use_async
+                'memory_limit_mb': memory_limit_mb
             }
         }
         
@@ -462,8 +408,30 @@ async def async_stream_papers(dataset):
         await asyncio.sleep(0)  # 让出控制权
 
 
+async def process_and_save(
+    dataset, 
+    tei_url,
+    output_dir, 
+    batch_size=80,          
+    prompt_name=None,
+    max_concurrent=20,
+    memory_limit_mb=500
+):
+    """流式处理 - 重构为异步流式处理"""
+    # 直接调用新的流式处理函数
+    return await stream_process_and_save(
+        dataset,
+        tei_url,
+        output_dir,
+        batch_size=batch_size,
+        prompt_name=prompt_name,
+        max_concurrent=max_concurrent,
+        memory_limit_mb=memory_limit_mb
+    )
+
+
 def main():
-    parser = argparse.ArgumentParser(description="GPU吞吐量优化的arXiv嵌入向量生成 - V3")
+    parser = argparse.ArgumentParser(description="流式异步arXiv嵌入向量生成")
     parser.add_argument("--input_file", type=str, default="data/arxiv/arxiv-metadata-oai-snapshot.json", 
                         help="arXiv元数据JSON文件路径")
     parser.add_argument("--output_dir", type=str, default="data/arxiv/embeddings", 
@@ -472,18 +440,16 @@ def main():
                         help="日志输出目录")
     parser.add_argument("--tei_url", type=str, default="http://127.0.0.1:8080/embed", 
                         help="TEI服务URL")
-    parser.add_argument("--batch_size", type=int, default=80, 
-                        help="批处理大小（优化GPU利用率，推荐50-100）")
-    parser.add_argument("--save_every", type=int, default=1000, 
-                        help="每处理多少篇论文保存一次进度")
+    parser.add_argument("--batch_size", type=int, default=50, 
+                        help="写入批次大小（内存控制，推荐20-100）")
     parser.add_argument("--max_concurrent", type=int, default=20, 
-                        help="最大并发请求数")
+                        help="最大并发请求数（并发控制）")
+    parser.add_argument("--memory_limit_mb", type=int, default=2048,
+                        help="内存使用限制（MB），超过时强制写入")
     parser.add_argument("--start_idx", type=int, default=0, 
                         help="从哪篇论文开始处理")
     parser.add_argument("--max_samples", type=int, default=None, 
                         help="最多处理多少篇论文，None表示处理所有")
-    parser.add_argument("--use_async", action="store_true", default=True,
-                        help="使用异步处理（推荐）")
     parser.add_argument("--log_level", type=str, default="INFO", 
                         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
                         help="日志级别")
@@ -504,12 +470,11 @@ def main():
         logging.info(f"参数 {arg}: {value}")
     logging.info("="*60)
     
-    logging.info(f"- 当前批次大小: {args.batch_size} 篇")
-    logging.info(f"- 预期批次处理时间: {args.batch_size / 40:.1f} 秒")
+    logging.info(f"- 流式处理：实时进度更新")
+    logging.info(f"- 写入批次大小: {args.batch_size} 篇")
     logging.info(f"- 最大并发请求: {args.max_concurrent}")
-    batch_memory_mb = args.batch_size * 32 / 1024  # 32KB per paper
-    logging.info(f"- 单批次内存占用: {batch_memory_mb:.1f} MB")
-    logging.info(f"- 保存间隔内存峰值: {args.save_every * 32 / 1024:.1f} MB")
+    logging.info(f"- 内存限制: {args.memory_limit_mb} MB")
+    logging.info(f"- 预期峰值吞吐量: 接近 50 篇/秒")
     
     # 测试TEI服务连接
     test_text = "This is a test text for TEI service connection."
@@ -543,10 +508,9 @@ def main():
             args.tei_url, 
             args.output_dir, 
             batch_size=args.batch_size,
-            save_every=args.save_every,
             prompt_name=args.prompt_name,
-            use_async=args.use_async,
-            max_concurrent=args.max_concurrent
+            max_concurrent=args.max_concurrent,
+            memory_limit_mb=args.memory_limit_mb
         )
         
         # 输出最终统计
