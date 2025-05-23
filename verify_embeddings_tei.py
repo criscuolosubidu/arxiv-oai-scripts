@@ -15,6 +15,8 @@ import numpy as np
 import requests
 import time
 from tqdm import tqdm
+import os
+import datetime
 
 # 配置日志
 logging.basicConfig(
@@ -44,6 +46,8 @@ def load_embeddings_h5(h5_file_path):
         logging.info(f"加载了 {len(paper_ids)} 篇论文的嵌入向量")
         logging.info(f"标题嵌入维度: {title_embeddings.shape}")
         logging.info(f"摘要嵌入维度: {abstract_embeddings.shape}")
+        logging.info(f"标题嵌入数据类型: {title_embeddings.dtype}")
+        logging.info(f"摘要嵌入数据类型: {abstract_embeddings.dtype}")
         
     return paper_ids, title_embeddings, abstract_embeddings, embedding_info
 
@@ -207,7 +211,11 @@ def verify_embeddings_tei(
     try:
         test_embedding = call_tei_service(test_text, tei_url, prompt_name, max_retries, retry_delay)
         embedding_dim = test_embedding.shape[0]
+        original_dtype = test_embedding.dtype
+        test_embedding_float32 = test_embedding.astype(np.float32)
         logging.info(f"TEI服务连接成功，嵌入维度: {embedding_dim}")
+        logging.info(f"TEI服务返回的向量类型: {original_dtype}")
+        logging.info(f"转换为float32后的向量类型: {test_embedding_float32.dtype}")
     except Exception as e:
         logging.error(f"TEI服务连接测试失败: {str(e)}")
         logging.error("请确保TEI服务正在运行，并且可以通过指定的URL访问")
@@ -227,6 +235,7 @@ def verify_embeddings_tei(
     
     title_cos_sims = []
     abstract_cos_sims = []
+    error_details = []  # 新增：用于存储错误详情的列表
     
     logging.info(f"正在验证 {num_samples} 个随机样本的嵌入向量...")
     
@@ -253,17 +262,51 @@ def verify_embeddings_tei(
             computed_title_emb = call_tei_service(title_text, tei_url, prompt_name, max_retries, retry_delay)
             computed_abstract_emb = call_tei_service(abstract_text, tei_url, prompt_name, max_retries, retry_delay)
             
+            # 确保精度一致：将TEI服务返回的向量转换为float32，与H5文件中存储的格式一致
+            computed_title_emb = computed_title_emb.astype(np.float32)
+            computed_abstract_emb = computed_abstract_emb.astype(np.float32)
+            
             # 计算余弦相似度
+            stored_title_norm = np.linalg.norm(stored_title_emb)
+            computed_title_norm = np.linalg.norm(computed_title_emb)
             title_cos_sim = np.dot(stored_title_emb, computed_title_emb) / (
-                np.linalg.norm(stored_title_emb) * np.linalg.norm(computed_title_emb)
+                stored_title_norm * computed_title_norm
             )
             
+            stored_abstract_norm = np.linalg.norm(stored_abstract_emb)
+            computed_abstract_norm = np.linalg.norm(computed_abstract_emb)
             abstract_cos_sim = np.dot(stored_abstract_emb, computed_abstract_emb) / (
-                np.linalg.norm(stored_abstract_emb) * np.linalg.norm(computed_abstract_emb)
+                stored_abstract_norm * computed_abstract_norm
             )
             
             title_cos_sims.append(title_cos_sim)
             abstract_cos_sims.append(abstract_cos_sim)
+
+            # 新增：检查并记录标题错误
+            if title_cos_sim <= 0.95:
+                error_details.append({
+                    "paper_id": paper_id,
+                    "type": "title",
+                    "text": title_text,
+                    "cosine_similarity": float(title_cos_sim),
+                    "stored_norm": float(stored_title_norm),
+                    "computed_norm": float(computed_title_norm),
+                    "stored_dtype": str(stored_title_emb.dtype),
+                    "computed_dtype": str(computed_title_emb.dtype)
+                })
+
+            # 新增：检查并记录摘要错误
+            if abstract_cos_sim <= 0.95:
+                error_details.append({
+                    "paper_id": paper_id,
+                    "type": "abstract",
+                    "text": abstract_text,
+                    "cosine_similarity": float(abstract_cos_sim),
+                    "stored_norm": float(stored_abstract_norm),
+                    "computed_norm": float(computed_abstract_norm),
+                    "stored_dtype": str(stored_abstract_emb.dtype),
+                    "computed_dtype": str(computed_abstract_emb.dtype)
+                })
             
         except Exception as e:
             logging.error(f"处理论文 {paper_id} 时出错: {str(e)}")
@@ -271,6 +314,9 @@ def verify_embeddings_tei(
     # 输出验证结果
     if not title_cos_sims or not abstract_cos_sims:
         logging.error("没有成功验证任何样本，无法计算相似度")
+        # 新增：保存错误详情（即使没有成功验证的样本，也可能已经收集到错误）
+        if error_details:
+            save_error_details(error_details, h5_file_path)
         return False
     
     avg_title_sim = np.mean(title_cos_sims)
@@ -290,6 +336,11 @@ def verify_embeddings_tei(
         logging.warning("这可能是由于TEI服务配置不同、随机性或其他因素导致的")
         embedding_match = False
     
+    # 新增：保存错误详情
+    if error_details:
+        save_error_details(error_details, h5_file_path)
+        logging.info(f"已将 {len(error_details)} 条错误详情保存到文件中")
+
     # 输出总体验证结果
     if ids_match and order_match and embedding_match:
         logging.info("="*50)
@@ -301,6 +352,30 @@ def verify_embeddings_tei(
         logging.warning("验证发现问题！请检查上述错误信息")
         logging.warning("="*50)
         return False
+
+
+def save_error_details(error_details, h5_file_path):
+    """将错误详情保存到JSON文件"""
+    if not error_details:
+        logging.info("没有发现错误，无需保存错误详情文件。")
+        return
+
+    # 从h5_file_path派生输出目录和文件名
+    # 假设h5_file_path类似于 '.../data/arxiv/embeddings/arxiv_embeddings_tei_YYYYMMDD_HHMMSS.h5'
+    # 我们希望输出到 '.../data/arxiv/embeddings/error_embeddings_YYYYMMDD_HHMMSS.json'
+    base_dir = os.path.dirname(h5_file_path)
+    
+    # 创建时间戳
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    error_filename = f"error_embeddings_{timestamp}.json"
+    output_path = os.path.join(base_dir, error_filename)
+    
+    try:
+        with open(output_path, 'w', encoding='utf-8') as f:
+            json.dump(error_details, f, ensure_ascii=False, indent=4)
+        logging.info(f"错误详情已成功保存到: {output_path}")
+    except IOError as e:
+        logging.error(f"保存错误详情文件失败: {str(e)}")
 
 
 def main():
