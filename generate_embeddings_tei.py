@@ -294,6 +294,7 @@ async def stream_process_and_save(
     start_time = time.time()
     total_processed = 0
     completed_results = []
+    failed_count = 0  # 添加全局失败计数器
     
     # 用于统计吞吐量
     last_time = start_time
@@ -338,39 +339,42 @@ async def stream_process_and_save(
                         completed_results.append(result)
                         total_processed += 1
                         pbar.update(1)  # 实时更新进度条
+                    else:
+                        failed_count += 1  # 记录失败数量
                         
-                        # 检查内存使用并及时写入
-                        current_memory = get_memory_usage()
-                        should_write = (
-                            len(completed_results) >= batch_size or 
-                            current_memory > memory_limit_mb or
-                            (finished and not pending_tasks)  # 最后一批
-                        )
+                    # 检查内存使用并及时写入
+                    current_memory = get_memory_usage()
+                    should_write = (
+                        len(completed_results) >= batch_size or 
+                        current_memory > memory_limit_mb or
+                        (finished and not pending_tasks)  # 最后一批
+                    )
+                    
+                    if should_write and completed_results:
+                        # 批量写入HDF5
+                        batch_ids = [r[0] for r in completed_results]
+                        batch_title_embeddings = [r[1] for r in completed_results]
+                        batch_abstract_embeddings = [r[2] for r in completed_results]
                         
-                        if should_write and completed_results:
-                            # 批量写入HDF5
-                            batch_ids = [r[0] for r in completed_results]
-                            batch_title_embeddings = [r[1] for r in completed_results]
-                            batch_abstract_embeddings = [r[2] for r in completed_results]
-                            
-                            hdf5_writer.append_batch(batch_ids, batch_title_embeddings, batch_abstract_embeddings)
-                            
-                            # 立即释放内存
-                            del batch_ids, batch_title_embeddings, batch_abstract_embeddings
-                            completed_results.clear()
-                            gc.collect()
-                            
-                            # 计算当前吞吐量
-                            current_time = time.time()
-                            if current_time - last_time >= 10:  # 每10秒计算一次吞吐量
-                                recent_throughput = (total_processed - last_processed) / (current_time - last_time)
-                                memory_mb = get_memory_usage()
-                                logging.info(f"已处理 {total_processed} 篇论文 | "
-                                           f"当前吞吐量: {recent_throughput:.1f} 篇/秒 | "
-                                           f"内存使用: {memory_mb:.2f} MB | "
-                                           f"活跃任务: {len(pending_tasks)}")
-                                last_time = current_time
-                                last_processed = total_processed
+                        hdf5_writer.append_batch(batch_ids, batch_title_embeddings, batch_abstract_embeddings)
+                        
+                        # 立即释放内存
+                        del batch_ids, batch_title_embeddings, batch_abstract_embeddings
+                        completed_results.clear()
+                        gc.collect()
+                        
+                        # 计算当前吞吐量
+                        current_time = time.time()
+                        if current_time - last_time >= 10:  # 每10秒计算一次吞吐量
+                            recent_throughput = (total_processed - last_processed) / (current_time - last_time)
+                            memory_mb = get_memory_usage()
+                            logging.info(f"已处理 {total_processed} 篇论文 | "
+                                       f"失败 {failed_count} 篇 | "
+                                       f"当前吞吐量: {recent_throughput:.1f} 篇/秒 | "
+                                       f"内存使用: {memory_mb:.2f} MB | "
+                                       f"活跃任务: {len(pending_tasks)}")
+                            last_time = current_time
+                            last_processed = total_processed
         
         pbar.close()
         
@@ -385,6 +389,8 @@ async def stream_process_and_save(
                 'creation_date': datetime.now().isoformat(),
                 'prompt_name': prompt_name,
                 'total_papers': total_processed,
+                'failed_papers': failed_count,
+                'success_rate': f"{(total_processed / (total_processed + failed_count) * 100):.2f}%" if (total_processed + failed_count) > 0 else "0%",
                 'processing_method': 'streaming_process',
                 'data_type': 'float16',
                 'compression': 'gzip_level_9',
