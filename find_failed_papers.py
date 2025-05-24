@@ -338,7 +338,7 @@ def print_summary(results):
 
 def main():
     parser = argparse.ArgumentParser(description="查找嵌入生成失败的论文ID")
-    parser.add_argument("--arxiv_metadata", type=str, required=True, help="原始arXiv元数据JSON文件路径")
+    parser.add_argument("--arxiv_metadata", type=str, help="原始arXiv元数据JSON文件路径")
     parser.add_argument("--h5_file", type=str, help="生成的H5嵌入文件路径")
     parser.add_argument("--log_files", nargs="+", help="日志文件路径（可以指定多个）")
     parser.add_argument("--output_dir", type=str, default="failed_papers_analysis", help="输出目录")
