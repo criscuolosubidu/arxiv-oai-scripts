@@ -56,15 +56,67 @@ def get_memory_usage():
 
 
 class StreamingArxivDataset:
-    """流式arXiv数据集，逐行读取，不预加载"""
+    """流式arXiv数据集，支持JSONL和JSON格式，逐行读取，不预加载"""
     
     def __init__(self, file_path, start_idx=0, max_samples=None):
         self.file_path = file_path
         self.start_idx = start_idx
         self.max_samples = max_samples
+        self.file_format = self._detect_file_format()
         
+    def _detect_file_format(self):
+        """检测文件格式：JSONL 或 JSON"""
+        try:
+            with open(self.file_path, 'r', encoding='utf-8') as f:
+                first_line = f.readline().strip()
+                if not first_line:
+                    raise ValueError("文件为空")
+                
+                # 尝试解析第一行
+                try:
+                    json.loads(first_line)
+                    # 检查第二行是否也是有效的JSON对象
+                    second_line = f.readline().strip()
+                    if second_line:
+                        try:
+                            json.loads(second_line)
+                            return 'jsonl'  # 多行，每行都是JSON对象
+                        except json.JSONDecodeError:
+                            pass
+                    
+                    # 只有一行或第二行不是JSON，检查是否是JSON数组
+                    f.seek(0)
+                    content = f.read().strip()
+                    if content.startswith('[') and content.endswith(']'):
+                        json.loads(content)  # 验证是否为有效JSON
+                        return 'json'
+                    else:
+                        return 'jsonl'  # 默认为JSONL
+                        
+                except json.JSONDecodeError:
+                    # 第一行不是有效JSON，可能是JSON数组的一部分
+                    f.seek(0)
+                    content = f.read().strip()
+                    if content.startswith('[') and content.endswith(']'):
+                        json.loads(content)
+                        return 'json'
+                    else:
+                        raise ValueError("无法识别的文件格式")
+                        
+        except Exception as e:
+            raise ValueError(f"检测文件格式失败: {str(e)}")
+    
     def stream_papers(self):
-        """流式迭代论文数据"""
+        """流式迭代论文数据，支持JSONL和JSON格式"""
+        if self.file_format == 'jsonl':
+            yield from self._stream_jsonl()
+        elif self.file_format == 'json':
+            yield from self._stream_json()
+        else:
+            raise ValueError(f"不支持的文件格式: {self.file_format}")
+    
+    def _stream_jsonl(self):
+        """处理JSONL格式文件"""
         count = 0
         processed = 0
         
@@ -79,18 +131,10 @@ class StreamingArxivDataset:
                     paper = json.loads(line)
                     count += 1
                     
-                    # 检查必要字段
-                    if 'title' in paper and 'abstract' in paper and paper['title'] and paper['abstract']:
-                        yield {
-                            'id': paper.get('id', ''),
-                            'title': paper.get('title', '').replace('\n', ' '),
-                            'abstract': paper.get('abstract', '').replace('\n', ' '),
-                            'authors': paper.get('authors', ''),
-                            'categories': paper.get('categories', ''),
-                            'journal_ref': paper.get('journal-ref', ''),
-                            'doi': paper.get('doi', ''),
-                            'update_date': paper.get('update_date', '')
-                        }
+                    # 检查必要字段并处理
+                    processed_paper = self._process_paper(paper)
+                    if processed_paper:
+                        yield processed_paper
                         processed += 1
                         
                         if self.max_samples and processed >= self.max_samples:
@@ -98,6 +142,56 @@ class StreamingArxivDataset:
                             
                 except json.JSONDecodeError:
                     continue
+    
+    def _stream_json(self):
+        """处理JSON格式文件（list[dict]）"""
+        try:
+            with open(self.file_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                
+            if not isinstance(data, list):
+                raise ValueError("JSON文件必须包含一个字典列表")
+            
+            processed = 0
+            
+            # 应用start_idx和max_samples
+            start_idx = self.start_idx
+            end_idx = len(data)
+            
+            if self.max_samples:
+                end_idx = min(start_idx + self.max_samples, len(data))
+            
+            for i in range(start_idx, end_idx):
+                if i >= len(data):
+                    break
+                    
+                paper = data[i]
+                processed_paper = self._process_paper(paper)
+                if processed_paper:
+                    yield processed_paper
+                    processed += 1
+                    
+                    if self.max_samples and processed >= self.max_samples:
+                        break
+                        
+        except Exception as e:
+            raise ValueError(f"处理JSON文件失败: {str(e)}")
+    
+    def _process_paper(self, paper):
+        """处理单篇论文数据，统一格式"""
+        # 检查必要字段
+        if 'title' in paper and 'abstract' in paper and paper['title'] and paper['abstract']:
+            return {
+                'id': paper.get('id', ''),
+                'title': paper.get('title', '').replace('\n', ' '),
+                'abstract': paper.get('abstract', '').replace('\n', ' '),
+                'authors': paper.get('authors', ''),
+                'categories': paper.get('categories', ''),
+                'journal_ref': paper.get('journal-ref', ''),
+                'doi': paper.get('doi', ''),
+                'update_date': paper.get('update_date', '')
+            }
+        return None
 
 
 async def call_tei_service_async(session, text, tei_url, prompt_name=None, max_retries=3):
@@ -443,7 +537,7 @@ async def process_and_save(
 def main():
     parser = argparse.ArgumentParser(description="流式异步arXiv嵌入向量生成")
     parser.add_argument("--input_file", type=str, default="data/arxiv/arxiv-metadata-oai-snapshot.json", 
-                        help="arXiv元数据JSON文件路径")
+                        help="arXiv元数据文件路径，支持JSONL格式（每行一个JSON对象）和JSON格式（包含字典列表的JSON文件）")
     parser.add_argument("--output_dir", type=str, default="data/arxiv/embeddings", 
                         help="嵌入向量输出目录")
     parser.add_argument("--log_dir", type=str, default="logs", 
@@ -505,6 +599,7 @@ def main():
     
     # 创建流式数据集
     dataset = StreamingArxivDataset(args.input_file, start_idx=args.start_idx, max_samples=args.max_samples)
+    logging.info(f"检测到文件格式: {dataset.file_format.upper()}")
     
     # 输出初始内存使用情况
     initial_memory = get_memory_usage()
