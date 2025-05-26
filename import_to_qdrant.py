@@ -2,34 +2,14 @@
 # -*- coding: utf-8 -*-
 
 """
-将H5格式的嵌入向量文件导入到Qdrant向量数据库
-支持批量导入、断点续传、进度监控等功能
+多进程并行版本：将H5格式的嵌入向量文件导入到Qdrant向量数据库
+使用多进程并行上传，显著提升导入性能
 
-支持的元数据格式（自动检测）：
-1. JSON格式: 
-   - 论文列表: [{"id": "...", "title": "..."}, ...]
-   - 包装对象: {"papers": [{"id": "...", "title": "..."}, ...]}
-   - 单个论文: {"id": "...", "title": "..."}
-
-2. JSONL格式: 每行一个JSON对象
-   {"id": "0704.0001", "title": "...", "abstract": "..."}
-   {"id": "0704.0002", "title": "...", "abstract": "..."}
-
-支持的元数据字段：
-- id: 论文ID (如 "0704.0001")
-- submitter: 提交者
-- authors: 作者列表字符串
-- title: 论文标题
-- comments: 评论信息
-- journal-ref: 期刊引用
-- doi: DOI标识符
-- report-no: 报告编号
-- categories: 分类标签
-- license: 许可证信息
-- abstract: 论文摘要
-- versions: 版本历史列表
-- update_date: 更新日期
-- authors_parsed: 解析后的作者信息列表
+性能优化特点：
+1. 多进程并行处理，充分利用多核CPU
+2. 每个进程独立处理数据片段
+3. 进程间负载均衡
+4. 实时进度监控和错误收集
 """
 
 import os
@@ -41,7 +21,9 @@ import numpy as np
 from tqdm import tqdm
 from datetime import datetime
 import time
-from typing import List, Dict, Any, Optional
+import multiprocessing as mp
+from typing import List, Dict, Any, Optional, Tuple
+import traceback
 
 try:
     from qdrant_client import QdrantClient
@@ -58,11 +40,11 @@ def setup_logger(log_dir: str = "logs", log_level: int = logging.INFO) -> loggin
     os.makedirs(log_dir, exist_ok=True)
     
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_file = os.path.join(log_dir, f"qdrant_import_{timestamp}.log")
+    log_file = os.path.join(log_dir, f"qdrant_import_mp_{timestamp}.log")
     
     logging.basicConfig(
         level=log_level,
-        format='%(asctime)s - %(levelname)s - %(message)s',
+        format='%(asctime)s - %(levelname)s - [PID:%(process)d] - %(message)s',
         handlers=[
             logging.FileHandler(log_file, encoding='utf-8'),
             logging.StreamHandler()
@@ -72,8 +54,202 @@ def setup_logger(log_dir: str = "logs", log_level: int = logging.INFO) -> loggin
     return logging.getLogger(__name__)
 
 
-class QdrantImporter:
-    """Qdrant向量数据库导入器"""
+def load_metadata(metadata_file_path: str) -> Dict[str, Dict[str, Any]]:
+    """加载元数据文件"""
+    metadata = {}
+    if not metadata_file_path or not os.path.exists(metadata_file_path):
+        return metadata
+    
+    with open(metadata_file_path, 'r', encoding='utf-8') as f:
+        # 判断文件格式
+        first_line = f.readline().strip()
+        f.seek(0)
+        
+        is_jsonl = False
+        if first_line:
+            try:
+                first_obj = json.loads(first_line)
+                if isinstance(first_obj, dict) and 'id' in first_obj:
+                    second_line = f.readline().strip()
+                    if second_line:
+                        try:
+                            json.loads(second_line)
+                            is_jsonl = True
+                        except json.JSONDecodeError:
+                            pass
+                    f.seek(0)
+            except json.JSONDecodeError:
+                pass
+        
+        if is_jsonl:
+            # JSONL格式
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        paper = json.loads(line)
+                        if 'id' in paper:
+                            metadata[paper['id']] = paper
+                    except json.JSONDecodeError:
+                        continue
+        else:
+            # JSON格式
+            try:
+                metadata_json = json.load(f)
+                
+                if isinstance(metadata_json, list):
+                    papers = metadata_json
+                elif isinstance(metadata_json, dict):
+                    if 'papers' in metadata_json:
+                        papers = metadata_json.get('papers', [])
+                    elif 'id' in metadata_json:
+                        papers = [metadata_json]
+                    else:
+                        papers = metadata_json.get('papers', [])
+                else:
+                    papers = []
+                
+                for paper in papers:
+                    if isinstance(paper, dict) and 'id' in paper:
+                        metadata[paper['id']] = paper
+                        
+            except json.JSONDecodeError:
+                pass
+    
+    return metadata
+
+
+def worker_process(
+    process_id: int,
+    h5_file_path: str,
+    metadata: Dict[str, Dict[str, Any]],
+    start_idx: int,
+    end_idx: int,
+    qdrant_url: str,
+    collection_name: str,
+    batch_size: int,
+    use_title: bool,
+    use_abstract: bool,
+    timeout: int,
+    progress_queue: mp.Queue,
+    result_queue: mp.Queue
+) -> None:
+    """工作进程函数"""
+    try:
+        # 创建进程专用的Qdrant客户端
+        client = QdrantClient(url=qdrant_url, timeout=timeout)
+        
+        # 打开H5文件
+        with h5py.File(h5_file_path, 'r') as h5f:
+            paper_ids = h5f['paper_ids']
+            title_embeddings = h5f['title_embeddings']
+            abstract_embeddings = h5f['abstract_embeddings']
+            
+            points_imported = 0
+            failed_imports = 0
+            
+            # 批量处理
+            for i in range(start_idx, end_idx, batch_size):
+                batch_end = min(i + batch_size, end_idx)
+                batch_points = []
+                
+                for idx in range(i, batch_end):
+                    try:
+                        # 获取论文ID
+                        paper_id = paper_ids[idx]
+                        if isinstance(paper_id, bytes):
+                            paper_id = paper_id.decode('utf-8')
+                        
+                        # 准备向量
+                        vectors = {}
+                        if use_title:
+                            vectors["title"] = title_embeddings[idx].tolist()
+                        if use_abstract:
+                            vectors["abstract"] = abstract_embeddings[idx].tolist()
+                        
+                        # 准备载荷
+                        payload = {
+                            "id": paper_id,
+                            "paper_id": paper_id
+                        }
+                        
+                        # 添加元数据
+                        if paper_id in metadata:
+                            paper_meta = metadata[paper_id]
+                            payload.update({
+                                "title": paper_meta.get("title", ""),
+                                "abstract": paper_meta.get("abstract", ""),
+                                "authors": paper_meta.get("authors", ""),
+                                "categories": paper_meta.get("categories", ""),
+                                "doi": paper_meta.get("doi", ""),
+                                "journal-ref": paper_meta.get("journal-ref", ""),
+                                "update_date": paper_meta.get("update_date", ""),
+                                "authors_parsed": paper_meta.get("authors_parsed", [])
+                            })
+                        
+                        # 创建点
+                        point = PointStruct(
+                            id=idx,
+                            vector=vectors,
+                            payload=payload
+                        )
+                        
+                        batch_points.append(point)
+                        
+                    except Exception as e:
+                        failed_imports += 1
+                        continue
+                
+                # 上传批次（带重试）
+                if batch_points:
+                    max_retries = 3
+                    retry_delay = 1
+                    
+                    for retry in range(max_retries):
+                        try:
+                            client.upsert(
+                                collection_name=collection_name,
+                                points=batch_points
+                            )
+                            points_imported += len(batch_points)
+                            break
+                        except Exception as e:
+                            if retry < max_retries - 1:
+                                time.sleep(retry_delay)
+                                retry_delay *= 2
+                            else:
+                                failed_imports += len(batch_points)
+                
+                # 报告进度
+                progress_queue.put({
+                    'process_id': process_id,
+                    'imported': len(batch_points),
+                    'failed': 0 if batch_points else len(range(i, batch_end))
+                })
+        
+        # 报告最终结果
+        result_queue.put({
+            'process_id': process_id,
+            'success': True,
+            'points_imported': points_imported,
+            'failed_imports': failed_imports,
+            'error': None
+        })
+        
+    except Exception as e:
+        # 报告错误
+        result_queue.put({
+            'process_id': process_id,
+            'success': False,
+            'points_imported': 0,
+            'failed_imports': 0,
+            'error': str(e),
+            'traceback': traceback.format_exc()
+        })
+
+
+class MultiProcessQdrantImporter:
+    """多进程Qdrant向量数据库导入器"""
     
     def __init__(
         self, 
@@ -81,25 +257,23 @@ class QdrantImporter:
         collection_name: str = "arxiv_papers",
         vector_size: int = 4096,
         distance_metric: str = "Cosine",
-        timeout: int = 300  # 5分钟超时
+        timeout: int = 300,
+        num_processes: int = None
     ):
-        # 创建Qdrant客户端，设置更长的超时时间
-        self.client = QdrantClient(
-            url=qdrant_url,
-            timeout=timeout  # 设置超时时间
-        )
+        self.qdrant_url = qdrant_url  # 保存URL以便传递给子进程
+        self.client = QdrantClient(url=qdrant_url, timeout=timeout)
         self.collection_name = collection_name
         self.vector_size = vector_size
         self.distance_metric = getattr(Distance, distance_metric.upper())
         self.timeout = timeout
+        self.num_processes = num_processes or mp.cpu_count()
         self.logger = logging.getLogger(__name__)
         
-        self.logger.info(f"Qdrant客户端初始化完成，超时时间: {timeout}秒")
+        self.logger.info(f"多进程导入器初始化完成，进程数: {self.num_processes}")
     
     def create_collection(self, recreate: bool = False) -> bool:
         """创建Qdrant集合"""
         try:
-            # 检查集合是否存在
             collections = self.client.get_collections()
             collection_exists = any(
                 col.name == self.collection_name 
@@ -114,7 +288,6 @@ class QdrantImporter:
                     self.logger.info(f"集合 {self.collection_name} 已存在，将追加数据")
                     return True
             
-            # 创建新集合
             self.logger.info(f"创建新集合: {self.collection_name}")
             self.client.create_collection(
                 collection_name=self.collection_name,
@@ -137,19 +310,6 @@ class QdrantImporter:
             self.logger.error(f"创建集合失败: {str(e)}")
             return False
     
-    def get_collection_info(self) -> Dict[str, Any]:
-        """获取集合信息"""
-        try:
-            info = self.client.get_collection(self.collection_name)
-            return {
-                "点数量": info.points_count,
-                "向量配置": info.config.params.vectors,
-                "状态": info.status
-            }
-        except Exception as e:
-            self.logger.error(f"获取集合信息失败: {str(e)}")
-            return {}
-    
     def import_from_h5(
         self, 
         h5_file_path: str,
@@ -160,298 +320,146 @@ class QdrantImporter:
         use_title: bool = True,
         use_abstract: bool = True
     ) -> bool:
-        """从H5文件导入向量到Qdrant"""
+        """多进程导入H5文件到Qdrant"""
         
         try:
-            # 加载H5文件
-            self.logger.info(f"加载H5文件: {h5_file_path}")
+            # 获取数据总量
             with h5py.File(h5_file_path, 'r') as h5f:
-                paper_ids = h5f['paper_ids'][:]
-                title_embeddings = h5f['title_embeddings']
-                abstract_embeddings = h5f['abstract_embeddings']
-                
-                total_papers = len(paper_ids)
+                total_papers = len(h5f['paper_ids'])
                 self.logger.info(f"H5文件包含 {total_papers:,} 篇论文的向量")
-                
-                # 确定处理范围
-                end_index = min(
-                    start_index + (max_points or total_papers), 
-                    total_papers
-                )
-                
-                self.logger.info(f"将处理索引 {start_index} 到 {end_index-1} 的数据")
-                
-                # 加载元数据
-                metadata = {}
-                if metadata_file_path and os.path.exists(metadata_file_path):
-                    self.logger.info(f"加载元数据文件: {metadata_file_path}")
-                    
-                    with open(metadata_file_path, 'r', encoding='utf-8') as f:
-                        # 先读取第一行来判断格式
-                        first_line = f.readline().strip()
-                        f.seek(0)  # 重置文件指针
-                        
-                        # 尝试判断文件格式
-                        is_jsonl = False
-                        if first_line:
-                            try:
-                                # 尝试解析第一行为JSON对象
-                                first_obj = json.loads(first_line)
-                                if isinstance(first_obj, dict) and 'id' in first_obj:
-                                    # 检查是否还有第二行
-                                    second_line = f.readline().strip()
-                                    if second_line:
-                                        try:
-                                            # 如果第二行也能解析为JSON对象，则判断为JSONL
-                                            json.loads(second_line)
-                                            is_jsonl = True
-                                        except json.JSONDecodeError:
-                                            # 第二行解析失败，可能是JSON格式
-                                            pass
-                                    f.seek(0)  # 重置文件指针
-                            except json.JSONDecodeError:
-                                # 第一行不是有效JSON，尝试作为完整JSON文件解析
-                                pass
-                        
-                        if is_jsonl:
-                            # JSONL格式：每行一个JSON对象
-                            self.logger.info("检测到JSONL格式")
-                            line_count = 0
-                            error_count = 0
-                            
-                            # 先计算总行数用于进度显示
-                            f.seek(0)
-                            total_lines = sum(1 for line in f if line.strip())
-                            f.seek(0)
-                            
-                            self.logger.info(f"JSONL文件包含 {total_lines:,} 行")
-                            
-                            for line_num, line in enumerate(f, 1):
-                                line = line.strip()
-                                if line:
-                                    try:
-                                        paper = json.loads(line)
-                                        if 'id' in paper:
-                                            metadata[paper['id']] = paper
-                                            line_count += 1
-                                        else:
-                                            self.logger.warning(f"第{line_num}行缺少'id'字段")
-                                            error_count += 1
-                                    except json.JSONDecodeError as e:
-                                        self.logger.warning(f"解析JSONL第{line_num}行失败: {str(e)}")
-                                        error_count += 1
-                                        continue
-                                
-                                # 每10000行显示一次进度
-                                if line_num % 10000 == 0:
-                                    self.logger.info(f"已处理 {line_num:,}/{total_lines:,} 行，成功加载 {line_count:,} 篇论文")
-                            
-                            self.logger.info(f"从JSONL文件加载了 {len(metadata)} 篇论文的元数据")
-                            if error_count > 0:
-                                self.logger.warning(f"跳过了 {error_count} 行错误数据")
-                        else:
-                            # JSON格式
-                            self.logger.info("检测到JSON格式")
-                            try:
-                                metadata_json = json.load(f)
-                                
-                                # 支持多种JSON格式
-                                if isinstance(metadata_json, list):
-                                    # 直接是论文列表
-                                    papers = metadata_json
-                                elif isinstance(metadata_json, dict):
-                                    if 'papers' in metadata_json:
-                                        # 包含papers字段的对象
-                                        papers = metadata_json.get('papers', [])
-                                    elif 'id' in metadata_json:
-                                        # 单个论文对象
-                                        papers = [metadata_json]
-                                    else:
-                                        # 其他格式，尝试获取papers字段
-                                        papers = metadata_json.get('papers', [])
-                                else:
-                                    self.logger.error("不支持的JSON格式")
-                                    papers = []
-                                
-                                # 构建ID到元数据的映射
-                                for paper in papers:
-                                    if isinstance(paper, dict) and 'id' in paper:
-                                        metadata[paper['id']] = paper
-                                
-                                self.logger.info(f"从JSON文件加载了 {len(metadata)} 篇论文的元数据")
-                                
-                            except json.JSONDecodeError as e:
-                                self.logger.error(f"解析JSON文件失败: {str(e)}")
-                                return False
-                
-                # 批量处理和导入
-                points_imported = 0
-                failed_imports = 0
-                
-                for i in tqdm(
-                    range(start_index, end_index, batch_size),
-                    desc="导入向量到Qdrant"
-                ):
-                    batch_end = min(i + batch_size, end_index)
-                    
-                    # 准备批次数据
-                    batch_points = []
-                    
-                    for idx in range(i, batch_end):
-                        try:
-                            # 获取论文ID
-                            paper_id = paper_ids[idx]
-                            if isinstance(paper_id, bytes):
-                                paper_id = paper_id.decode('utf-8')
-                            
-                            # 准备向量
-                            vectors = {}
-                            if use_title:
-                                vectors["title"] = title_embeddings[idx].tolist()
-                            if use_abstract:
-                                vectors["abstract"] = abstract_embeddings[idx].tolist()
-                            
-                            # 准备载荷（元数据）
-                            payload = {
-                                "id": paper_id,  # 确保论文ID包含在载荷中
-                                "paper_id": paper_id  # 保持向后兼容
-                            }
-                            
-                            # 添加详细元数据（如果可用）
-                            if paper_id in metadata:
-                                paper_meta = metadata[paper_id]
-                                
-                                # 记录第一个处理的论文的元数据字段（用于调试）
-                                if idx == start_index:
-                                    available_fields = list(paper_meta.keys())
-                                    self.logger.info(f"检测到的元数据字段: {available_fields}")
-                                
-                                payload.update({
-                                    # 基本信息
-                                    "title": paper_meta.get("title", ""),
-                                    "abstract": paper_meta.get("abstract", ""),
-                                    "authors": paper_meta.get("authors", ""),
-                                    
-                                    # 分类和标识
-                                    "categories": paper_meta.get("categories", ""),
-                                    "doi": paper_meta.get("doi", ""),
-                                    
-                                    # 期刊和出版信息
-                                    "journal-ref": paper_meta.get("journal-ref", ""),
-                                    
-                                    # 时间信息
-                                    "update_date": paper_meta.get("update_date", ""),
-                                    
-                                    # 解析后的作者信息（保持为列表结构）
-                                    "authors_parsed": paper_meta.get("authors_parsed", [])
-                                })
-                            
-                            # 创建点
-                            point = PointStruct(
-                                id=idx,  # 使用索引作为ID
-                                vector=vectors,
-                                payload=payload
-                            )
-                            
-                            batch_points.append(point)
-                            
-                        except Exception as e:
-                            self.logger.warning(f"处理索引 {idx} 的数据时出错: {str(e)}")
-                            failed_imports += 1
-                            continue
-                    
-                    # 批量上传到Qdrant（带重试机制）
-                    if batch_points:
-                        upload_success = False
-                        max_retries = 3
-                        retry_delay = 1  # 秒
-                        
-                        for retry in range(max_retries):
-                            try:
-                                self.logger.debug(f"尝试上传批次 {i//batch_size + 1}，重试次数: {retry + 1}/{max_retries}")
-                                
-                                self.client.upsert(
-                                    collection_name=self.collection_name,
-                                    points=batch_points
-                                )
-                                
-                                points_imported += len(batch_points)
-                                upload_success = True
-                                
-                                # 每1000个点记录一次进度
-                                if points_imported % 1000 == 0:
-                                    self.logger.info(f"已导入 {points_imported:,} 个点")
-                                
-                                break  # 成功上传，跳出重试循环
-                                
-                            except Exception as e:
-                                error_msg = str(e)
-                                if "timed out" in error_msg.lower() or "timeout" in error_msg.lower():
-                                    self.logger.warning(f"上传超时 (重试 {retry + 1}/{max_retries}): {error_msg}")
-                                else:
-                                    self.logger.warning(f"上传失败 (重试 {retry + 1}/{max_retries}): {error_msg}")
-                                
-                                if retry < max_retries - 1:  # 不是最后一次重试
-                                    self.logger.info(f"等待 {retry_delay} 秒后重试...")
-                                    time.sleep(retry_delay)
-                                    retry_delay *= 2  # 指数退避
-                                else:
-                                    self.logger.error(f"批量上传最终失败，跳过 {len(batch_points)} 个点")
-                                    self.logger.error(f"建议：如果持续超时，请尝试减小 --batch_size 参数（当前: {batch_size}）")
-                                    failed_imports += len(batch_points)
-                        
-                        if not upload_success:
-                            continue
-                
-                # 导入完成统计
-                self.logger.info(f"导入完成!")
-                self.logger.info(f"成功导入: {points_imported:,} 个点")
-                if failed_imports > 0:
-                    self.logger.warning(f"导入失败: {failed_imports:,} 个点")
-                
-                return True
-                
-        except Exception as e:
-            self.logger.error(f"导入过程中发生错误: {str(e)}")
-            return False
-    
-    def search_similar(
-        self, 
-        query_vector: List[float], 
-        vector_name: str = "title",
-        limit: int = 10,
-        score_threshold: float = 0.7
-    ) -> List[Dict[str, Any]]:
-        """搜索相似向量"""
-        try:
-            results = self.client.search(
-                collection_name=self.collection_name,
-                query_vector=(vector_name, query_vector),
-                limit=limit,
-                score_threshold=score_threshold,
-                with_payload=True
+            
+            # 确定处理范围
+            end_index = min(
+                start_index + (max_points or total_papers), 
+                total_papers
             )
+            total_to_process = end_index - start_index
             
-            return [
-                {
-                    "id": result.id,
-                    "score": result.score,
-                    "payload": result.payload
-                }
-                for result in results
-            ]
+            self.logger.info(f"将处理索引 {start_index} 到 {end_index-1} 的数据")
+            
+            # 加载元数据
+            self.logger.info("加载元数据...")
+            metadata = load_metadata(metadata_file_path)
+            self.logger.info(f"加载了 {len(metadata)} 篇论文的元数据")
+            
+            # 计算每个进程的数据范围
+            chunk_size = total_to_process // self.num_processes
+            if chunk_size == 0:
+                chunk_size = 1
+                self.num_processes = total_to_process
+            
+            process_ranges = []
+            for i in range(self.num_processes):
+                proc_start = start_index + i * chunk_size
+                if i == self.num_processes - 1:
+                    proc_end = end_index  # 最后一个进程处理剩余所有数据
+                else:
+                    proc_end = proc_start + chunk_size
+                
+                if proc_start < end_index:
+                    process_ranges.append((proc_start, proc_end))
+            
+            self.logger.info(f"数据分片: {len(process_ranges)} 个进程")
+            for i, (start, end) in enumerate(process_ranges):
+                self.logger.info(f"进程 {i}: 索引 {start} 到 {end-1} ({end-start} 个点)")
+            
+            # 创建进程间通信队列
+            progress_queue = mp.Queue()
+            result_queue = mp.Queue()
+            
+            # 启动工作进程
+            processes = []
+            for i, (proc_start, proc_end) in enumerate(process_ranges):
+                p = mp.Process(
+                    target=worker_process,
+                    args=(
+                        i, h5_file_path, metadata, proc_start, proc_end,
+                        self.qdrant_url, self.collection_name,
+                        batch_size, use_title, use_abstract, self.timeout,
+                        progress_queue, result_queue
+                    )
+                )
+                p.start()
+                processes.append(p)
+            
+            # 监控进度
+            total_imported = 0
+            total_failed = 0
+            process_stats = {i: {'imported': 0, 'failed': 0} for i in range(len(processes))}
+            
+            # 使用tqdm显示总体进度
+            with tqdm(total=total_to_process, desc="多进程导入进度") as pbar:
+                # 收集进度更新
+                active_processes = len(processes)
+                while active_processes > 0:
+                    try:
+                        # 检查进度更新
+                        try:
+                            progress_update = progress_queue.get(timeout=1)
+                            process_id = progress_update['process_id']
+                            imported = progress_update['imported']
+                            failed = progress_update['failed']
+                            
+                            process_stats[process_id]['imported'] += imported
+                            process_stats[process_id]['failed'] += failed
+                            
+                            pbar.update(imported + failed)
+                            
+                        except:
+                            pass  # 超时，继续检查进程状态
+                        
+                        # 检查是否有进程完成
+                        for p in processes[:]:
+                            if not p.is_alive():
+                                processes.remove(p)
+                                active_processes -= 1
+                    
+                    except KeyboardInterrupt:
+                        self.logger.info("收到中断信号，正在停止所有进程...")
+                        for p in processes:
+                            p.terminate()
+                        break
+            
+            # 等待所有进程完成
+            for p in processes:
+                p.join()
+            
+            # 收集最终结果
+            results = []
+            while not result_queue.empty():
+                results.append(result_queue.get())
+            
+            # 统计结果
+            for result in results:
+                if result['success']:
+                    total_imported += result['points_imported']
+                    total_failed += result['failed_imports']
+                    self.logger.info(f"进程 {result['process_id']} 完成: "
+                                   f"导入 {result['points_imported']}, "
+                                   f"失败 {result['failed_imports']}")
+                else:
+                    self.logger.error(f"进程 {result['process_id']} 失败: {result['error']}")
+                    if 'traceback' in result:
+                        self.logger.debug(f"错误详情:\n{result['traceback']}")
+            
+            self.logger.info(f"多进程导入完成!")
+            self.logger.info(f"总计导入: {total_imported:,} 个点")
+            if total_failed > 0:
+                self.logger.warning(f"总计失败: {total_failed:,} 个点")
+            
+            return True
             
         except Exception as e:
-            self.logger.error(f"搜索失败: {str(e)}")
-            return []
+            self.logger.error(f"多进程导入过程中发生错误: {str(e)}")
+            return False
 
 
 def main():
-    parser = argparse.ArgumentParser(description="将H5嵌入向量文件导入到Qdrant")
+    parser = argparse.ArgumentParser(description="多进程并行将H5嵌入向量文件导入到Qdrant")
     parser.add_argument("--h5_file", type=str, required=True,
                         help="H5嵌入向量文件路径")
     parser.add_argument("--metadata_file", type=str,
-                        help="元数据文件路径 (自动检测JSON/JSONL格式)")
+                        help="元数据文件路径")
     parser.add_argument("--qdrant_url", type=str, default="http://localhost:6333",
                         help="Qdrant服务URL")
     parser.add_argument("--collection_name", type=str, default="arxiv_papers",
@@ -463,7 +471,7 @@ def main():
     parser.add_argument("--max_points", type=int,
                         help="最大导入点数")
     parser.add_argument("--recreate_collection", action="store_true",
-                        help="重新创建集合（删除现有数据）")
+                        help="重新创建集合")
     parser.add_argument("--use_title", action="store_true", default=True,
                         help="导入标题向量")
     parser.add_argument("--use_abstract", action="store_true", default=True,
@@ -471,13 +479,15 @@ def main():
     parser.add_argument("--distance_metric", type=str, default="Cosine",
                         choices=["Cosine", "Euclidean", "Dot"],
                         help="距离度量方式")
+    parser.add_argument("--num_processes", type=int,
+                        help="并行进程数（默认为CPU核心数）")
+    parser.add_argument("--timeout", type=int, default=300,
+                        help="Qdrant客户端超时时间（秒）")
     parser.add_argument("--log_dir", type=str, default="logs",
                         help="日志输出目录")
     parser.add_argument("--log_level", type=str, default="INFO",
-                        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+                        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
                         help="日志级别")
-    parser.add_argument("--timeout", type=int, default=300,
-                        help="Qdrant客户端超时时间（秒），默认300秒")
     
     args = parser.parse_args()
     
@@ -485,42 +495,34 @@ def main():
     log_level = getattr(logging, args.log_level)
     logger = setup_logger(args.log_dir, log_level)
     
-    # 检查文件是否存在
+    # 检查文件
     if not os.path.exists(args.h5_file):
         logger.error(f"H5文件不存在: {args.h5_file}")
         return
     
-    if args.metadata_file and not os.path.exists(args.metadata_file):
-        logger.error(f"元数据文件不存在: {args.metadata_file}")
-        return
-    
     # 获取向量维度
-    vector_size = 4096  # 默认值
+    vector_size = 4096
     try:
         with h5py.File(args.h5_file, 'r') as h5f:
             vector_size = h5f['title_embeddings'].shape[1]
             logger.info(f"检测到向量维度: {vector_size}")
     except Exception as e:
-        logger.warning(f"无法检测向量维度，使用默认值 {vector_size}: {str(e)}")
+        logger.warning(f"无法检测向量维度，使用默认值 {vector_size}")
     
-    # 创建导入器
-    importer = QdrantImporter(
+    # 创建多进程导入器
+    importer = MultiProcessQdrantImporter(
         qdrant_url=args.qdrant_url,
         collection_name=args.collection_name,
         vector_size=vector_size,
         distance_metric=args.distance_metric,
-        timeout=args.timeout
+        timeout=args.timeout,
+        num_processes=args.num_processes
     )
     
     # 创建集合
     if not importer.create_collection(recreate=args.recreate_collection):
-        logger.error("创建集合失败，退出")
+        logger.error("创建集合失败")
         return
-    
-    # 显示集合信息
-    info = importer.get_collection_info()
-    if info:
-        logger.info(f"集合信息: {info}")
     
     # 开始导入
     start_time = time.time()
@@ -538,50 +540,10 @@ def main():
     duration = end_time - start_time
     
     if success:
-        logger.info(f"导入完成，耗时: {duration:.2f} 秒")
-        
-        # 显示最终集合信息
-        final_info = importer.get_collection_info()
-        if final_info:
-            logger.info(f"最终集合信息: {final_info}")
+        logger.info(f"多进程导入完成，耗时: {duration:.2f} 秒")
     else:
-        logger.error("导入失败")
+        logger.error("多进程导入失败")
 
 
 if __name__ == "__main__":
     main()
-
-# 支持的元数据格式示例（自动检测）：
-
-# 1. JSON格式 - 论文列表:
-# [
-#   {
-#     "id": "0704.0001",
-#     "submitter": "Pavel Nadolsky",
-#     "authors": "C. Bal\\'azs, E. L. Berger, P. M. Nadolsky, C.-P. Yuan",
-#     "title": "Calculation of prompt diphoton production cross sections at Tevatron and LHC energies",
-#     "abstract": "A fully differential calculation..."
-#   },
-#   {"id": "0704.0002", "title": "Another paper", "abstract": "..."}
-# ]
-
-# 2. JSON格式 - 包装对象:
-# {
-#   "papers": [
-#     {"id": "0704.0001", "title": "Paper 1", "abstract": "..."},
-#     {"id": "0704.0002", "title": "Paper 2", "abstract": "..."}
-#   ]
-# }
-
-# 3. JSON格式 - 单个论文:
-# {
-#   "id": "0704.0001",
-#   "submitter": "Pavel Nadolsky",
-#   "title": "Calculation of prompt diphoton production cross sections",
-#   "abstract": "A fully differential calculation..."
-# }
-
-# 4. JSONL格式 - 每行一个JSON对象:
-# {"id": "0704.0001", "submitter": "Pavel Nadolsky", "title": "Paper 1", "abstract": "..."}
-# {"id": "0704.0002", "submitter": "Another Author", "title": "Paper 2", "abstract": "..."}
-# {"id": "0704.0003", "submitter": "Third Author", "title": "Paper 3", "abstract": "..."}
