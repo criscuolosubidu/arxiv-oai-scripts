@@ -233,7 +233,8 @@ python import_to_qdrant.py \
     --use_title \
     --use_abstract \
     --distance_metric Cosine \
-    --log_level INFO
+    --log_level INFO \
+    --num_processes 16
 ```
 
 #### 参数说明
@@ -249,6 +250,7 @@ python import_to_qdrant.py \
 - `--use_title`: 导入标题向量（默认: True）
 - `--use_abstract`: 导入摘要向量（默认: True）
 - `--distance_metric`: 距离度量方式（Cosine/Euclidean/Dot，默认: Cosine）
+- `--num_processes`：并行执行的进程数量（默认使用CPU的所有核心）
 
 #### 断点续传
 
