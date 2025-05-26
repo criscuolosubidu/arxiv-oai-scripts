@@ -96,20 +96,6 @@ class QdrantImporter:
         
         self.logger.info(f"Qdrant客户端初始化完成，超时时间: {timeout}秒")
     
-    def _process_metadata_field(self, value: Any, max_length: Optional[int] = None) -> Any:
-        """处理元数据字段，确保数据类型适合Qdrant存储"""
-        if value is None:
-            return ""
-        
-        if isinstance(value, (list, dict)):
-            # 对于复杂数据结构，转换为JSON字符串或保持原样，这里因为qdrant支持，所以无需转换
-            return value
-        
-        if isinstance(value, str) and max_length:
-            return value[:max_length]
-        
-        return str(value) if not isinstance(value, (int, float, bool)) else value
-        
     def create_collection(self, recreate: bool = False) -> bool:
         """创建Qdrant集合"""
         try:
@@ -342,22 +328,22 @@ class QdrantImporter:
                                 
                                 payload.update({
                                     # 基本信息
-                                    "title": self._process_metadata_field(paper_meta.get("title", ""), 1024),
-                                    "abstract": self._process_metadata_field(paper_meta.get("abstract", ""), 4096),
-                                    "authors": self._process_metadata_field(paper_meta.get("authors", ""), 1024),
+                                    "title": paper_meta.get("title", ""),
+                                    "abstract": paper_meta.get("abstract", ""),
+                                    "authors": paper_meta.get("authors", ""),
                                     
                                     # 分类和标识
-                                    "categories": self._process_metadata_field(paper_meta.get("categories", ""), 256),
-                                    "doi": self._process_metadata_field(paper_meta.get("doi", ""), 100),
+                                    "categories": paper_meta.get("categories", ""),
+                                    "doi": paper_meta.get("doi", ""),
                                     
                                     # 期刊和出版信息
-                                    "journal-ref": self._process_metadata_field(paper_meta.get("journal-ref", ""), 300),
+                                    "journal-ref": paper_meta.get("journal-ref", ""),
                                     
                                     # 时间信息
-                                    "update_date": self._process_metadata_field(paper_meta.get("update_date", ""), 50),
+                                    "update_date": paper_meta.get("update_date", ""),
                                     
                                     # 解析后的作者信息（保持为列表结构）
-                                    "authors_parsed": self._process_metadata_field(paper_meta.get("authors_parsed", []))
+                                    "authors_parsed": paper_meta.get("authors_parsed", [])
                                 })
                             
                             # 创建点
