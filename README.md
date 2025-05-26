@@ -13,6 +13,7 @@
 - 🧠 高质量语义向量生成
 - 🔍 向量质量验证和分析
 - 🚀 支持多种推理后端（TEI、sentence-transformers等）
+- 🗄️ Qdrant向量数据库集成，支持高效语义搜索
 
 ## 📦 数据集下载
 
@@ -63,6 +64,9 @@
 ├── 📄 parse_files.py                # 文件解析
 ├── 📋 requirements.txt              # Python依赖
 ├── 🔍 search_arxiv_papers.py        # 论文搜索
+├── 🗄️ import_to_qdrant.py           # 向量导入Qdrant
+├── 🔍 search_with_qdrant.py         # Qdrant语义搜索
+├── 🚀 run_qdrant.sh                 # Qdrant启动脚本
 ├── 🦀 src/
 │   └── main.rs                      # Rust源码
 ├── 📦 unzip_files.py                # 解压工具
@@ -81,6 +85,8 @@
 | `generate_embeddings_tei.py` | 使用TEI引擎生成向量（**推荐**） | 高效生成 |
 | `find_failed_papers.py` | 后处理工具，查找生成失败的文件 | 错误排查 |
 | `merge_h5_files.py` | 合并多个H5向量文件 | 数据整合 |
+| `import_to_qdrant.py` | 将H5向量文件导入Qdrant向量数据库 | 向量存储 |
+| `search_with_qdrant.py` | 使用Qdrant进行语义搜索 | 向量检索 |
 
 ## 🚀 快速开始
 
@@ -88,7 +94,7 @@
 
 ```bash
 # 克隆项目
-git clone <repository-url>
+git clone https://github.com/criscuolosubidu/arxiv-oai-scripts.git
 cd arxiv-oai-scripts
 
 # 安装依赖
@@ -136,6 +142,262 @@ python generate_embeddings_tei.py \
 - `max_concurrent`：设置为CPU核心数，平衡并发和内存使用
 - `memory_limit_mb`：防止内存溢出，根据系统内存设置
 
+
+## 🗄️ Qdrant向量数据库集成
+
+本项目支持将生成的向量导入到Qdrant向量数据库中，实现高效的语义搜索功能。
+
+### 前置条件
+
+#### 1. 安装Qdrant客户端依赖
+
+```bash
+pip install qdrant-client
+```
+
+或者安装完整的依赖：
+
+```bash
+pip install -r requirements.txt
+```
+
+#### 2. 启动Qdrant服务
+
+首先拉取Qdrant镜像：
+
+```bash
+# 拉取AMD GPU版本镜像
+docker pull qdrant/qdrant:gpu-amd-latest
+
+# 或者拉取NVIDIA GPU版本镜像
+docker pull qdrant/qdrant:gpu-nvidia-latest
+```
+
+**AMD GPU用户（推荐）：**
+
+```bash
+# 使用提供的脚本启动（AMD GPU）
+sudo ./run_qdrant.sh
+
+# 或者手动启动AMD GPU版本
+docker run \
+    --rm \
+    --device /dev/kfd --device /dev/dri \
+    -p 6333:6333 \
+    -p 6334:6334 \
+    -e QDRANT__LOG_LEVEL=debug \
+    -e QDRANT__GPU__INDEXING=1 \
+    qdrant/qdrant:gpu-amd-latest
+```
+
+**NVIDIA GPU用户：**
+
+```bash
+docker run \
+    --rm \
+    --gpus=all \
+    -p 6333:6333 \
+    -p 6334:6334 \
+    -e QDRANT__GPU__INDEXING=1 \
+    qdrant/qdrant:gpu-nvidia-latest
+```
+
+等待Qdrant服务启动完成（通常需要几分钟下载镜像）。
+
+#### 3. 验证Qdrant服务
+
+访问 http://localhost:6333/dashboard 查看Qdrant管理界面，这里可以很方便操作和查看collection的数据。
+
+### 导入向量数据
+
+#### 基本用法
+
+```bash
+python import_to_qdrant.py \
+    --h5_file data/arxiv/embeddings/arxiv_embeddings_20241201_123456.h5 \
+    --metadata_file data/arxiv/embeddings/arxiv_metadata_20241201_123456.json
+```
+
+#### 完整参数示例
+
+```bash
+python import_to_qdrant.py \
+    --h5_file data/arxiv/embeddings/arxiv_embeddings_20241201_123456.h5 \
+    --metadata_file data/arxiv/embeddings/arxiv_metadata_20241201_123456.json \
+    --qdrant_url http://localhost:6333 \
+    --collection_name arxiv_papers \
+    --batch_size 100 \
+    --start_index 0 \
+    --max_points 10000 \
+    --recreate_collection \
+    --use_title \
+    --use_abstract \
+    --distance_metric Cosine \
+    --log_level INFO
+```
+
+#### 参数说明
+
+- `--h5_file`: H5嵌入向量文件路径（必需）
+- `--metadata_file`: 元数据JSON文件路径（可选，但推荐）
+- `--qdrant_url`: Qdrant服务URL（默认: http://localhost:6333）
+- `--collection_name`: 集合名称（默认: arxiv_papers）
+- `--batch_size`: 批量导入大小（默认: 100）
+- `--start_index`: 开始导入的索引位置（默认: 0，用于断点续传）
+- `--max_points`: 最大导入点数（可选，用于测试）
+- `--recreate_collection`: 重新创建集合（删除现有数据）
+- `--use_title`: 导入标题向量（默认: True）
+- `--use_abstract`: 导入摘要向量（默认: True）
+- `--distance_metric`: 距离度量方式（Cosine/Euclidean/Dot，默认: Cosine）
+
+#### 断点续传
+
+如果导入过程中断，可以从指定位置继续：
+
+```bash
+python import_to_qdrant.py \
+    --h5_file your_file.h5 \
+    --metadata_file your_metadata.json \
+    --start_index 5000  # 从第5000个向量开始
+```
+
+### 语义搜索
+
+#### 基本搜索
+
+```bash
+python search_with_qdrant.py \
+    --query "machine learning transformer attention mechanism" \
+    --model_path models/e5-mistral-7b-instruct
+```
+
+#### 完整搜索示例
+
+```bash
+python search_with_qdrant.py \
+    --query "deep learning for natural language processing" \
+    --qdrant_url http://localhost:6333 \
+    --collection_name arxiv_papers \
+    --model_path models/e5-mistral-7b-instruct \
+    --vector_name title \
+    --top_k 10 \
+    --score_threshold 0.7
+```
+
+#### 搜索参数说明
+
+- `--query`: 搜索查询文本（必需）
+- `--qdrant_url`: Qdrant服务URL
+- `--collection_name`: 集合名称
+- `--model_path`: 嵌入模型路径（必须与生成向量时使用的模型相同）
+- `--vector_name`: 使用的向量类型（title或abstract）
+- `--top_k`: 返回结果数量
+- `--score_threshold`: 相似度阈值
+
+### Qdrant性能优化建议
+
+#### 1. 导入优化
+
+- **批量大小**: 根据内存情况调整`--batch_size`，通常100-500比较合适
+- **GPU加速**: 确保Qdrant启用了GPU索引（`QDRANT__GPU__INDEXING=1`）
+- **分批导入**: 对于大型数据集，可以分多次导入
+
+#### 2. 搜索优化
+
+- **向量选择**: 根据查询类型选择合适的向量（title或abstract）
+- **阈值调整**: 调整`score_threshold`来平衡结果质量和数量
+- **缓存模型**: 避免重复加载嵌入模型
+
+#### 3. 内存管理
+
+- **监控内存**: 导入大量数据时监控系统内存使用
+- **分批处理**: 使用`--max_points`参数进行分批测试
+
+### 故障排除
+
+#### 1. Qdrant连接问题
+
+```bash
+# 检查Qdrant服务状态
+curl http://localhost:6333/health
+
+# 查看Docker容器日志
+docker logs <container_id>
+```
+
+#### 2. 内存不足
+
+- 减小`--batch_size`参数
+- 使用`--max_points`限制导入数量
+- 确保有足够的系统内存
+
+#### 3. 向量维度不匹配
+
+确保H5文件中的向量维度与Qdrant集合配置一致。脚本会自动检测向量维度。
+
+#### 4. 模型路径问题
+
+确保搜索时使用的模型路径与生成嵌入向量时使用的模型相同。
+
+### 完整的端到端示例
+
+#### 1. 启动Qdrant
+
+```bash
+# AMD GPU用户
+sudo ./run_qdrant.sh
+
+# 或者手动启动
+docker run \
+    --rm \
+    --device /dev/kfd --device /dev/dri \
+    -p 6333:6333 \
+    -p 6334:6334 \
+    -e QDRANT__LOG_LEVEL=debug \
+    -e QDRANT__GPU__INDEXING=1 \
+    qdrant/qdrant:gpu-amd-latest
+```
+
+#### 2. 导入向量（测试少量数据）
+
+```bash
+python import_to_qdrant.py \
+    --h5_file data/arxiv/embeddings/arxiv_embeddings_20241201_123456.h5 \
+    --metadata_file data/arxiv/embeddings/arxiv_metadata_20241201_123456.json \
+    --max_points 1000 \
+    --recreate_collection
+```
+
+#### 3. 验证导入
+
+访问 http://localhost:6333/dashboard 查看集合状态
+
+#### 4. 执行搜索
+
+```bash
+python search_with_qdrant.py \
+    --query "transformer neural networks" \
+    --top_k 5
+```
+
+#### 5. 生产环境完整导入
+
+```bash
+python import_to_qdrant.py \
+    --h5_file your_full_dataset.h5 \
+    --metadata_file your_metadata.json \
+    --batch_size 200 \
+    --recreate_collection
+```
+
+### 注意事项
+
+1. **数据一致性**: 确保H5文件和元数据文件对应同一批数据
+2. **模型一致性**: 搜索时必须使用与生成向量相同的模型
+3. **资源监控**: 导入大量数据时监控CPU、内存和磁盘使用情况
+4. **备份**: 重要数据建议在导入前进行备份
+5. **版本兼容**: 确保qdrant-client版本与Qdrant服务版本兼容
+
 ## 🤝 贡献指南
 
 欢迎提交Issue和Pull Request！
@@ -154,6 +416,7 @@ python generate_embeddings_tei.py \
 
 - [Hugging Face](https://huggingface.co/) - 提供优秀的模型和推理引擎
 - [arXiv](https://arxiv.org/) - 提供开放的学术数据集
+- [Qdrant](https://qdrant.tech/) - 提供高性能向量数据库解决方案
 - 所有贡献者和使用者
 
 ## 📞 联系方式
