@@ -17,6 +17,7 @@ import logging
 import os
 from datetime import datetime
 
+
 def setup_logger(log_dir, log_level=logging.INFO, script_name="check_embeddings"):
     """设置日志记录器"""
     os.makedirs(log_dir, exist_ok=True)
@@ -42,7 +43,7 @@ def setup_logger(log_dir, log_level=logging.INFO, script_name="check_embeddings"
     
     return logger
 
-# 从 generate_embeddings_tei.py 复制并适配
+
 def call_tei_service_sync(text, tei_url, prompt_name=None, max_retries=3, retry_delay=1):
     """同步调用TEI服务获取文本嵌入向量 (返回fp16)"""
     payload = {"inputs": text, "normalize": False}
@@ -78,11 +79,12 @@ def call_tei_service_sync(text, tei_url, prompt_name=None, max_retries=3, retry_
     logging.error(f"达到最大重_TEI调用重试次数 ({max_retries})，无法获取嵌入: {text[:100]}...")
     return None
 
+
 def cosine_similarity(vec1, vec2):
     """计算两个向量的余弦相似度"""
-    # 确保向量是浮点数类型，以避免整数运算问题
-    vec1 = vec1.astype(np.float32)
-    vec2 = vec2.astype(np.float32)
+    # 确保向量是浮点数类型，以避免整数运算问题，使用float16，因为本质上我们只关心相似度，而且原生得到的就是fp16
+    vec1 = vec1.astype(np.float16)
+    vec2 = vec2.astype(np.float16)
     
     dot_product = np.dot(vec1, vec2)
     norm_vec1 = np.linalg.norm(vec1)
@@ -92,6 +94,69 @@ def cosine_similarity(vec1, vec2):
         return 0.0  # 避免除以零
         
     return dot_product / (norm_vec1 * norm_vec2)
+
+
+def generate_sampling_indices(total_count, num_samples, strategy="random", decay_strength=0.8):
+    """
+    根据指定策略生成采样索引
+    
+    Args:
+        total_count: 总数据量
+        num_samples: 需要采样的数量
+        strategy: 采样策略 ("random", "exponential_decay", "linear_decay")
+        decay_strength: 衰减强度 (0-1，值越大越偏向后面)
+    
+    Returns:
+        sorted list of indices
+    """
+    if strategy == "random":
+        # 原有的随机采样
+        return sorted(random.sample(range(total_count), num_samples))
+    
+    elif strategy == "exponential_decay":
+        # 从后往前指数衰减的采样分布
+        decay_rate = decay_strength * 5  # 将0-1的范围映射到0-5的衰减率
+        
+        # 计算每个位置的权重（从后往前衰减）
+        weights = []
+        for i in range(total_count):
+            # 位置越靠后权重越大
+            position_from_end = total_count - 1 - i
+            weight = np.exp(-decay_rate * position_from_end / total_count)
+            weights.append(weight)
+        
+        # 归一化权重
+        weights = np.array(weights)
+        weights = weights / np.sum(weights)
+        
+        # 根据权重进行采样
+        indices = np.random.choice(total_count, size=num_samples, replace=False, p=weights)
+        return sorted(indices.tolist())
+    
+    elif strategy == "linear_decay":
+        # 从后往前线性衰减的采样分布
+        
+        # 计算每个位置的权重（线性衰减）
+        weights = []
+        for i in range(total_count):
+            # 位置越靠后权重越大
+            position_from_end = total_count - 1 - i
+            # 线性衰减：最后位置权重为1，前面按比例递减
+            weight = 1.0 - decay_strength * position_from_end / total_count
+            weight = max(weight, 0.01)  # 确保最小权重不为0
+            weights.append(weight)
+        
+        # 归一化权重
+        weights = np.array(weights)
+        weights = weights / np.sum(weights)
+        
+        # 根据权重进行采样
+        indices = np.random.choice(total_count, size=num_samples, replace=False, p=weights)
+        return sorted(indices.tolist())
+    
+    else:
+        raise ValueError(f"未知的采样策略: {strategy}")
+
 
 def main():
     parser = argparse.ArgumentParser(description="检查arXiv嵌入向量的脚本")
@@ -110,6 +175,11 @@ def main():
     parser.add_argument("--log_level", type=str, default="INFO",
                         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
                         help="日志级别")
+    parser.add_argument("--sampling_strategy", type=str, default="random",
+                        choices=["random", "exponential_decay", "linear_decay"],
+                        help="采样策略: random=随机采样, exponential_decay=指数衰减采样, linear_decay=线性衰减采样")
+    parser.add_argument("--decay_strength", type=float, default=0.8,
+                        help="衰减采样策略的衰减强度 (0-1，值越大越偏向后面，默认0.8)")
     
     args = parser.parse_args()
 
@@ -122,6 +192,9 @@ def main():
     logger.info(f"原始元数据文件: {args.original_metadata_file}")
     logger.info(f"TEI URL: {args.tei_url}")
     logger.info(f"抽样数量: {args.num_samples}")
+    logger.info(f"采样策略: {args.sampling_strategy}")
+    if args.sampling_strategy in ["exponential_decay", "linear_decay"]:
+        logger.info(f"衰减强度: {args.decay_strength}")
     if args.prompt_name:
         logger.info(f"Prompt Name: {args.prompt_name}")
 
@@ -143,10 +216,34 @@ def main():
                 logger.warning(f"抽样数量 ({args.num_samples}) 大于总论文数 ({num_total_papers})，将检查所有论文。")
                 args.num_samples = num_total_papers
             
-            # 生成随机抽样索引
-            sampled_indices = sorted(random.sample(range(num_total_papers), args.num_samples))
+            # 生成采样索引
+            sampled_indices = generate_sampling_indices(
+                num_total_papers, 
+                args.num_samples, 
+                args.sampling_strategy, 
+                args.decay_strength
+            )
             
             logger.info(f"将从以下索引抽样: {sampled_indices}")
+            
+            # 显示采样分布信息
+            if args.sampling_strategy != "random":
+                quarters = [
+                    (0, num_total_papers // 4, "第1四分位"),
+                    (num_total_papers // 4, num_total_papers // 2, "第2四分位"), 
+                    (num_total_papers // 2, 3 * num_total_papers // 4, "第3四分位"),
+                    (3 * num_total_papers // 4, num_total_papers, "第4四分位")
+                ]
+                
+                logger.info("采样分布统计:")
+                for start, end, name in quarters:
+                    count = sum(1 for idx in sampled_indices if start <= idx < end)
+                    percentage = count / args.num_samples * 100
+                    logger.info(f"  {name}({start}-{end-1}): {count}个 ({percentage:.1f}%)")
+                
+                logger.info(f"  平均索引位置: {np.mean(sampled_indices):.1f} (总数: {num_total_papers})")
+            else:
+                logger.info("使用随机采样策略")
 
             # 获取抽样数据
             sampled_paper_ids = [hf['paper_ids'][i].decode('utf-8') for i in sampled_indices] # ID是vlen str
