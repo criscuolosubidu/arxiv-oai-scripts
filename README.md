@@ -116,7 +116,7 @@ cargo build --release
 > ⚠️ **重要提示**：对于`e5-mistral-7b-instruct`模型，我们使用平均池化（mean pooling）而非配置文件中的last-token池化方法。
 
 ```bash
-model="./models/e5-mistral-7b-instruct"
+model="./data/e5-mistral-7b-instruct"
 volume="$PWD/data"
 docker run --gpus all -p 8080:80 -v $volume:/data \
     --name text-embeddings-inference \
