@@ -8,6 +8,7 @@
 import argparse
 import logging
 from typing import List, Dict, Any
+import numpy as np
 from sentence_transformers import SentenceTransformer
 
 try:
@@ -28,7 +29,7 @@ def setup_logging():
 def search_papers(
     query_text: str,
     qdrant_url: str = "http://localhost:6333",
-    collection_name: str = "arxiv_papers",
+    collection_name: str = "arxiv_oai",
     model_path: str = "models/e5-mistral-7b-instruct",
     vector_name: str = "title",
     top_k: int = 10,
@@ -56,7 +57,11 @@ def search_papers(
     
     # 生成查询向量
     logging.info(f"生成查询向量: '{query_text}'")
-    query_vector = model.encode([query_text])[0].tolist()
+    query_vector = model.encode([query_text])[0]
+    
+    # 对查询向量进行L2归一化，与Qdrant的余弦相似度计算保持一致
+    query_vector = query_vector / np.linalg.norm(query_vector)
+    query_vector = query_vector.tolist()
     
     # 连接Qdrant
     logging.info(f"连接Qdrant: {qdrant_url}")
@@ -96,7 +101,7 @@ def main():
                         help="搜索查询文本")
     parser.add_argument("--qdrant_url", type=str, default="http://localhost:6333",
                         help="Qdrant服务URL")
-    parser.add_argument("--collection_name", type=str, default="arxiv_papers",
+    parser.add_argument("--collection_name", type=str, default="arxiv_oai",
                         help="Qdrant集合名称")
     parser.add_argument("--model_path", type=str, default="models/e5-mistral-7b-instruct",
                         help="嵌入模型路径")
