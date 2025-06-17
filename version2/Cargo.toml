@@ -1,0 +1,20 @@
+[package]
+name = "arxiv_embedding_rs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.11", features = ["json", "gzip", "brotli"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+log = "0.4"
+env_logger = "0.10"
+thiserror = "1.0"
+half = "2"
+hdf5 = { version = "0.10", features = ["zlib"] }
+async-recursion = "1"
+parking_lot = "0.12"
+tokio-util = "0.7"
+sysinfo = { version = "0.30", features = ["macros"] } 
