@@ -1,0 +1,11 @@
+/home/ubuntu/projects/dev/arxiv-oai-scripts/version2/target/debug/deps/libhdf5_types-29c8d33fcae8140a.rmeta: /home/ubuntu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hdf5-types-0.8.1/src/lib.rs /home/ubuntu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hdf5-types-0.8.1/src/array.rs /home/ubuntu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hdf5-types-0.8.1/src/dyn_value.rs /home/ubuntu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hdf5-types-0.8.1/src/h5type.rs /home/ubuntu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hdf5-types-0.8.1/src/string.rs
+
+/home/ubuntu/projects/dev/arxiv-oai-scripts/version2/target/debug/deps/libhdf5_types-29c8d33fcae8140a.rlib: /home/ubuntu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hdf5-types-0.8.1/src/lib.rs /home/ubuntu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hdf5-types-0.8.1/src/array.rs /home/ubuntu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hdf5-types-0.8.1/src/dyn_value.rs /home/ubuntu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hdf5-types-0.8.1/src/h5type.rs /home/ubuntu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hdf5-types-0.8.1/src/string.rs
+
+/home/ubuntu/projects/dev/arxiv-oai-scripts/version2/target/debug/deps/hdf5_types-29c8d33fcae8140a.d: /home/ubuntu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hdf5-types-0.8.1/src/lib.rs /home/ubuntu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hdf5-types-0.8.1/src/array.rs /home/ubuntu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hdf5-types-0.8.1/src/dyn_value.rs /home/ubuntu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hdf5-types-0.8.1/src/h5type.rs /home/ubuntu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hdf5-types-0.8.1/src/string.rs
+
+/home/ubuntu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hdf5-types-0.8.1/src/lib.rs:
+/home/ubuntu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hdf5-types-0.8.1/src/array.rs:
+/home/ubuntu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hdf5-types-0.8.1/src/dyn_value.rs:
+/home/ubuntu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hdf5-types-0.8.1/src/h5type.rs:
+/home/ubuntu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hdf5-types-0.8.1/src/string.rs:

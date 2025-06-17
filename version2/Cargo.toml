@@ -13,8 +13,12 @@ log = "0.4"
 env_logger = "0.10"
 thiserror = "1.0"
 half = "2"
-hdf5 = { version = "0.10", features = ["zlib"] }
+hdf5 = "0.8"
 async-recursion = "1"
 parking_lot = "0.12"
 tokio-util = "0.7"
-sysinfo = { version = "0.30", features = ["macros"] } 
+sysinfo = "0.30"
+futures = "0.3"
+anyhow = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+ndarray = "0.15" 
