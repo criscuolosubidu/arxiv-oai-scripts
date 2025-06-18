@@ -53,13 +53,48 @@ def load_embeddings_h5(h5_file_path):
 
 
 def load_metadata(metadata_file_path):
-    """加载元数据文件"""
-    with open(metadata_file_path, 'r', encoding='utf-8') as f:
-        metadata = json.load(f)
+    """加载元数据文件（支持JSON和JSONL格式）"""
+    papers = []
+    id_to_index = {}
+    embedding_info = {}
     
-    id_to_index = metadata.get('id_to_index', {})
-    papers = metadata.get('papers', [])
-    embedding_info = metadata.get('embedding_info', {})
+    try:
+        # 首先尝试作为标准JSON文件读取
+        with open(metadata_file_path, 'r', encoding='utf-8') as f:
+            metadata = json.load(f)
+        
+        id_to_index = metadata.get('id_to_index', {})
+        papers = metadata.get('papers', [])
+        embedding_info = metadata.get('embedding_info', {})
+        
+    except json.JSONDecodeError:
+        # 如果JSON解析失败，尝试JSONL格式
+        logging.info("标准JSON格式解析失败，尝试JSONL格式...")
+        
+        with open(metadata_file_path, 'r', encoding='utf-8') as f:
+            for line_num, line in enumerate(f):
+                line = line.strip()
+                if line:  # 跳过空行
+                    try:
+                        paper = json.loads(line)
+                        papers.append(paper)
+                        
+                        # 构建ID到索引的映射
+                        # 尝试多种可能的ID字段名
+                        paper_id = None
+                        for id_field in ['id', 'paper_id', 'arxiv_id', 'doi']:
+                            if id_field in paper:
+                                paper_id = paper[id_field]
+                                break
+                        
+                        if paper_id:
+                            id_to_index[paper_id] = line_num
+                        else:
+                            logging.warning(f"第{line_num}行的论文没有找到ID字段")
+                            
+                    except json.JSONDecodeError as e:
+                        logging.error(f"解析第{line_num}行JSON时出错: {e}")
+                        continue
     
     logging.info(f"加载了 {len(papers)} 篇论文的元数据")
     if embedding_info:
@@ -79,12 +114,12 @@ def display_embedding_statistics(embeddings, name="嵌入向量"):
     
     print(f"\n{name}统计信息:")
     print(f"  - 形状: {embeddings.shape}")
-    print(f"  - 均值范围: [{np.min(means):.4f}, {np.max(means):.4f}]")
-    print(f"  - 标准差范围: [{np.min(stds):.4f}, {np.max(stds):.4f}]")
-    print(f"  - 最小值范围: [{np.min(mins):.4f}, {np.max(mins):.4f}]")
-    print(f"  - 最大值范围: [{np.min(maxs):.4f}, {np.max(maxs):.4f}]")
-    print(f"  - 向量范数: 均值={np.mean(norms):.4f}, 标准差={np.std(norms):.4f}")
-    print(f"  - 范数范围: [{np.min(norms):.4f}, {np.max(norms):.4f}]")
+    print(f"  - 均值范围: [{np.min(means):.6f}, {np.max(means):.6f}]")
+    print(f"  - 标准差范围: [{np.min(stds):.6f}, {np.max(stds):.6f}]")
+    print(f"  - 最小值范围: [{np.min(mins):.6f}, {np.max(mins):.6f}]")
+    print(f"  - 最大值范围: [{np.min(maxs):.6f}, {np.max(maxs):.6f}]")
+    print(f"  - 向量范数: 均值={np.mean(norms):.6f}, 标准差={np.std(norms):.6f}")
+    print(f"  - 范数范围: [{np.min(norms):.6f}, {np.max(norms):.6f}]")
 
 
 def plot_embedding_pca(title_embeddings, abstract_embeddings, num_samples=100, output_file=None):
@@ -175,7 +210,7 @@ def display_paper_info(paper_idx, paper_id, paper, title_embedding, abstract_emb
 def display_vector_preview(vector, max_dims=10):
     """显示向量的前几个维度"""
     preview = vector[:max_dims]
-    preview_str = ", ".join([f"{x:.4f}" for x in preview])
+    preview_str = ", ".join([f"{x:.8f}" for x in preview])
     print(f"[{preview_str}, ... ]（共{len(vector)}维）")
 
 
