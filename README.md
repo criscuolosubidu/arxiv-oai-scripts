@@ -11,11 +11,10 @@
 本项目提供了一套完整的工具链，用于处理arXiv OAI开放数据集，主要功能包括：
 
 - 📄 **论文元数据分析和处理** - 支持数据质量检查、长度分布分析
-- 🧠 **高质量语义向量生成** - 支持多种推理后端（TEI、sentence-transformers、Rust）
+- 🧠 **高质量语义向量生成** - 支持多种推理后端（TEI、sentence-transformer, transformer, vllm）
 - 🔍 **向量质量验证和分析** - 提供多种验证策略和详细统计
 - 🗄️ **Qdrant向量数据库集成** - 支持高效语义搜索和多进程导入
 - ⚡ **性能优化** - GPU加速、并发处理、内存管理
-- 🦀 **Rust高性能组件** - 提供高吞吐量的向量生成实现
 
 ## 📦 数据集下载
 
@@ -43,7 +42,7 @@
 ## 📁 项目结构
 
 ```
-├── 📋 Cargo.toml                        # Rust项目配置
+├── 📋 Cargo.toml                        # 项目配置
 ├── 📄 LICENSE                           # MIT许可证
 ├── 📖 README.md                         # 项目文档
 ├── 🔍 analyze_arxiv_oai.py              # 元数据分析工具
@@ -68,9 +67,7 @@
 ├── 📋 requirements.txt                  # Python依赖
 ├── 🔍 search_arxiv_papers.py            # 论文搜索
 ├── 🗄️ import_to_qdrant.py               # 向量导入Qdrant
-├── 🔍 search_with_qdrant.py             # Qdrant语义搜索
-├── 🦀 src/
-│   └── main.rs                          # Rust高性能实现
+├── 🔍 search_with_qdrant.py             # Qdrant语义搜索                      
 ├── 🧪 test_sampling.py                  # 采样测试工具
 ├── 📦 unzip_files_pubmed.py             # PubMed解压工具
 └── ✅ verify_embeddings.py              # 向量验证
@@ -82,6 +79,7 @@
 |---------|---------|---------|
 | `analyze_arxiv_oai.py` | 分析下载的元数据完整性，统计标题和摘要长度分布 | 数据预处理 |
 | `generate_embeddings_tei.py` | 使用TEI引擎生成向量（**推荐**） | 高效生成 |
+| `generate_embeddings_with_vllm.py` | 使用vllm生成向量（**推荐**） | 高效生成 |
 | `generate_embeddings_arxiv_oai.py` | 使用sentence-transformers/transformers生成向量 | 向量生成 |
 | `check_h5_embeddings.py` | 校验H5文件中的向量质量 | 质量控制 |
 | `check_qdrant_or_h5_embeddings.py` | 统一的向量校验工具，支持多种采样策略 | 质量控制 |
@@ -91,7 +89,6 @@
 | `merge_h5_files.py` | 合并多个H5向量文件 | 数据整合 |
 | `import_to_qdrant.py` | 将H5向量文件导入Qdrant向量数据库（多进程） | 向量存储 |
 | `search_with_qdrant.py` | 使用Qdrant进行语义搜索 | 向量检索 |
-| `src/main.rs` | Rust实现的高性能向量生成器 | 高吞吐量生成 |
 
 ## 🚀 快速开始
 
@@ -102,12 +99,8 @@
 git clone https://github.com/criscuolosubidu/arxiv-oai-scripts.git
 cd arxiv-oai-scripts
 
-# 安装Python依赖
+# 安装Python依赖（推荐使用conda，并且python版本小于等于3.10.16
 pip install -r requirements.txt
-
-# （可选）编译Rust组件以获得最佳性能
-cargo build --release
-```
 
 ### 2. 部署TEI推理引擎（推荐）
 
@@ -163,29 +156,6 @@ python generate_embeddings_arxiv_oai.py \
     --storage_format h5
 ```
 
-#### 使用Rust高性能实现
-
-```bash
-# 编译并运行Rust版本
-cargo run --release -- \
-    --input-file data/arxiv-metadata-oai-snapshot.json \
-    --output-dir data/arxiv/embeddings \
-    --tei-url http://127.0.0.1:8080/embed \
-    --concurrency 40 \
-    --batch-size 100
-```
-
-### 5. 向量质量验证
-
-```bash
-# 验证生成的向量质量
-python check_h5_embeddings.py \
-    --h5_file data/arxiv/embeddings/arxiv_embeddings_20241201_123456.h5 \
-    --original_metadata_file data/arxiv-metadata-oai-snapshot.json \
-    --num_samples 1000 \
-    --sampling_strategy exponential_decay
-```
-
 ## 📊 性能优化建议
 
 ### 硬件配置
@@ -197,14 +167,6 @@ python check_h5_embeddings.py \
 - `batch_size`：根据显存大小调整，越大GPU利用率越高
 - `max_concurrent`：设置为CPU核心数，平衡并发和内存使用
 - `memory_limit_mb`：防止内存溢出，根据系统内存设置
-
-### 性能对比
-
-| 实现方式 | 吞吐量 | 内存使用 | GPU利用率 | 推荐场景 |
-|---------|--------|----------|-----------|----------|
-| TEI + Python | ~40 papers/sec | 中等 | 很高 | 生产环境 |
-| Transformers | ~15 papers/sec | 高 | 中等 | 开发测试 |
-| Rust + TEI | ~50+ papers/sec | 低 | 很高 | 大规模处理 |
 
 ## 🗄️ Qdrant向量数据库集成
 
@@ -491,26 +453,6 @@ source venv/bin/activate  # Linux/Mac
 pip install -r requirements.txt
 pip install black flake8 pytest
 
-# 安装Rust工具链（可选）
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-```
-
-### 代码规范
-
-```bash
-# Python代码格式化
-black *.py
-
-# 代码检查
-flake8 *.py
-
-# Rust代码格式化
-cargo fmt
-
-# Rust代码检查
-cargo clippy
-```
-
 ### 提交流程
 
 1. Fork本项目
@@ -548,13 +490,3 @@ cargo clippy
 ---
 
 ⭐ 如果这个项目对您有帮助，请给一个星标！
-
-## 📋 更新日志
-
-### v0.1.0 (2024-12-01)
-- ✨ 初始版本发布
-- 🚀 支持TEI和transformers后端
-- 🗄️ Qdrant向量数据库集成
-- 🦀 Rust高性能实现
-- 📊 完整的向量质量验证
-- 🔧 多进程并行处理
